@@ -1,0 +1,29 @@
+# dynfednas — modern, installable dependency set for the CIFAR-10 baseline.
+#
+# Rationale: the original requirements.txt pins torch 1.4 / tensorflow 1.14, which
+# do NOT install on current hardware (incl. Apple Silicon) or modern CUDA. This file
+# is the tested, loosened set. TensorFlow is intentionally omitted: it is only used by
+# the *federated* dataset loaders (fed_cifar100, FederatedEMNIST, shakespeare, ...),
+# NOT by the CIFAR-10 / CIFAR-100 / CINIC-10 image paths.
+#
+# The `ofa` package below is the PUBLIC mit-han-lab/once-for-all build; it replaces the
+# private `compofa-internal` fork. It requires the torch._six compatibility shim (see
+# SETUP_NOTES.md) because that pinned build predates the removal of torch._six.
+#
+# On an ETH GPU node, install torch/torchvision matching the node's CUDA version first
+# (see https://pytorch.org), then `pip install -r requirements-modern.txt`.
+
+torch
+torchvision
+ofa==0.1.0.post202012082159
+
+numpy
+scipy
+matplotlib
+tqdm
+scikit-learn
+networkx
+PyYAML
+Pillow
+h5py
+wandb          # experiment logging; run with WANDB_MODE=offline to disable
