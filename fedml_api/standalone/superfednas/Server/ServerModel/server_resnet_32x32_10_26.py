@@ -155,22 +155,25 @@ class ServerResnet_10_26(BaseServerModel):
 
     def is_max_net(self, arch):
         largest = True
-        for d in arch["d"]:
-            if d != 2:
+        d = arch["d"]
+        for dv in (d if isinstance(d, (list, tuple)) else [d]):
+            if dv != 2:
                 largest = False
-        for e in arch["e"]:
-            if e != 0.25:
+        e = arch["e"]
+        for ev in (e if isinstance(e, (list, tuple)) else [e]):
+            if ev != 0.25:
                 largest = False
         return largest
 
     def is_min_net(self, arch):
         smallest = True
-        for d in arch["d"]:
-            if d != 0:
+        d = arch["d"]
+        for dv in (d if isinstance(d, (list, tuple)) else [d]):
+            if dv != 0:
                 smallest = False
-
-        for e in arch["e"]:
-            if e != 0.1:
+        e = arch["e"]
+        for ev in (e if isinstance(e, (list, tuple)) else [e]):
+            if ev != 0.1:
                 smallest = False
         return smallest
 
