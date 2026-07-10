@@ -392,9 +392,15 @@ class FLOFA_Trainer(ABC):
                 )
             for _k, _v in comm_summary.items():
                 wandb.log({_k: _v, "round": round_num}, step=round_num)
+            capacity_note = ""
+            if self.args.subnet_dist_type == "capacity_aware":
+                capacity_note = " clamped=%d max_infeasible=%d" % (
+                    self.server_model.cap_num_clamped,
+                    self.server_model.cap_max_infeasible,
+                )
             logging.info(
                 "[comm_sim] round %d: participation=%.2f dropped=%d/%d "
-                "max_subnet_present=%d max_subnet_failed=%d MB_sent=%.1f"
+                "max_subnet_present=%d max_subnet_failed=%d MB_sent=%.1f%s"
                 % (
                     round_num,
                     comm_summary["comm/participation_rate"],
@@ -403,6 +409,7 @@ class FLOFA_Trainer(ABC):
                     comm_summary["comm/max_subnet_present"],
                     comm_summary["comm/max_subnet_failed"],
                     comm_summary["comm/MB_sent_round"],
+                    capacity_note,
                 )
             )
         if self.args.dry_run:

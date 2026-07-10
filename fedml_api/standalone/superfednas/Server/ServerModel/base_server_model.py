@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import wandb
 import os
+import logging
 import torch
 import numpy as np
 from wandb.sdk.lib import RunDisabled
@@ -392,6 +393,16 @@ class BaseServerModel(ABC):
         self._cap_tier_bits = tiers
         self._cap_max_bits = self._payload_bits(
             self.get_subnet(**self.max_subnet_arch())
+        )
+        logging.info(
+            "[capacity] tier payloads: %s | max subnet: %.1f MB"
+            % (
+                ", ".join(
+                    "%s -> %.1f MB" % (str(cfg), bits / 8e6)
+                    for bits, cfg in tiers
+                ),
+                self._cap_max_bits / 8e6,
+            )
         )
 
     def _budget_bits(self, client_idx):
