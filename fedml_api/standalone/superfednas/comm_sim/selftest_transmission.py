@@ -158,6 +158,78 @@ def test_truncation_and_boundaries():
     print("PASS truncation + boundaries + ordering")
 
 
+def test_clip_arch_config():
+    # middle-client arch: per-stage d, per-block e (as TS_all_random samples)
+    arch = {"d": [0, 1, 0, 2], "e": [0.25, 0.1, 0.18, 0.14], "w": [None, None]}
+    tier1 = {"d": [0, 1, 0, 1], "e": 0.14}
+    clipped = tx.clip_arch_config(arch, tier1)
+    assert clipped["d"] == [0, 1, 0, 1]
+    assert clipped["e"] == [0.14, 0.1, 0.14, 0.14]
+    assert clipped["w"] == [None, None]  # passthrough
+    # clipping by the max tier returns the arch itself
+    xl = {"d": [2, 2, 2, 2], "e": 0.25}
+    same = tx.clip_arch_config(arch, xl)
+    assert same["d"] == arch["d"] and same["e"] == arch["e"]
+    # nestedness of the clipped ladder: elementwise monotone in the tier
+    tiers = [
+        {"d": [0, 0, 0, 0], "e": 0.1},
+        {"d": [0, 1, 0, 1], "e": 0.14},
+        {"d": [1, 1, 1, 1], "e": 0.18},
+        {"d": [2, 2, 2, 2], "e": 0.25},
+    ]
+    prev = None
+    for t in tiers:
+        c = tx.clip_arch_config(arch, t)
+        if prev is not None:
+            assert all(a >= b for a, b in zip(c["d"], prev["d"]))
+            assert all(a >= b for a, b in zip(c["e"], prev["e"]))
+        prev = c
+    print("PASS clip_arch_config")
+
+
+def test_build_clipped_plan():
+    tiers = [
+        {"d": [0, 0, 0, 0], "e": 0.1},
+        {"d": [0, 1, 0, 1], "e": 0.14},
+        {"d": [1, 1, 1, 1], "e": 0.18},
+        {"d": [2, 2, 2, 2], "e": 0.25},
+    ]
+    arch = {"d": [0, 1, 0, 2], "e": [0.25, 0.1, 0.18, 0.14], "w": [None]}
+
+    # fake payload: monotone in the config (as real param counts are)
+    def payload(cfg):
+        e = cfg["e"] if isinstance(cfg["e"], (list, tuple)) else [cfg["e"]] * 4
+        return (sum(cfg["d"]) + 10 * sum(e)) * MBIT
+
+    plan = tx.build_clipped_plan(arch, tiers, payload)
+    assert plan.train_tier == 3
+    # top of the clipped ladder is α itself (completing the plan == delivering α)
+    top_cfg = plan.tiers[-1][1]
+    assert top_cfg["d"] == arch["d"] and top_cfg["e"] == arch["e"]
+    bits = [b for b, _ in plan.tiers]
+    assert bits == sorted(bits), "clipped ladder must be ascending"
+    # every rung is the clip of α by that tier
+    for (b, cfg), t in zip(plan.tiers, tiers):
+        assert cfg == tx.clip_arch_config(arch, t)
+    print("PASS build_clipped_plan")
+
+
+def test_saturating_ladder():
+    # a small trained arch: clipped tiers saturate -> zero-size top shells
+    tiers = [
+        (8 * MBIT, {"tier": 0}),
+        (12 * MBIT, {"tier": 1}),
+        (12 * MBIT, {"tier": 2}),  # == tier 1: alpha already inside tier 1
+        (12 * MBIT, {"tier": 3}),
+    ]
+    plan = tx.TransmissionPlan(tiers, train_tier=3)
+    r = tx.truncate(plan, 12 * MBIT, 10 * MBIT, 20.0)
+    assert r.delivered_tier == 3 and r.completed_plan and r.bits_wasted == 0
+    r = tx.truncate(plan, 8 * MBIT, 10 * MBIT, 20.0)
+    assert r.delivered_tier == 0
+    print("PASS saturating clipped ladder")
+
+
 def test_monotonicity():
     plan = make_plan()
     window = 20.0
@@ -198,6 +270,9 @@ if __name__ == "__main__":
     test_legacy_equivalence()
     test_round_time()
     test_truncation_and_boundaries()
+    test_clip_arch_config()
+    test_build_clipped_plan()
+    test_saturating_ladder()
     test_monotonicity()
     test_nested_sim_accounting()
     print("ALL TRANSMISSION SELF-TESTS PASSED")

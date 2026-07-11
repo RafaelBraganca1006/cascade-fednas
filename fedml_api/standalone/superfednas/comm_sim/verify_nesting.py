@@ -20,11 +20,35 @@ per shell) that transmission.TransmissionPlan will use.
 
 import argparse
 import json
+import os
 import sys
+
+# make the repo root importable regardless of where the script is invoked from,
+# and elastic_nn/ for the bare `darts` import the ServerModel package pulls in
+# (same trick as train.py line ~34)
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.abspath(os.path.join(_here, "..", "..", "..", "..")))
+sys.path.append(os.path.abspath(os.path.join(_here, "..", "elastic_nn")))
 
 import torch
 
-from fedml_api.standalone.superfednas.Server.ServerModel import (  # noqa: F401
+# same torch._six compat shim as train.py — the pinned public ofa build still
+# imports torch._six, removed in torch >= 1.8. Must run before any ofa import.
+if not hasattr(torch, "_six"):
+    import types as _types
+    import queue as _queue
+    import collections.abc as _abc
+
+    _six = _types.ModuleType("torch._six")
+    _six.queue = _queue
+    _six.string_classes = (str,)
+    _six.int_classes = (int,)
+    _six.container_abcs = _abc
+    sys.modules["torch._six"] = _six
+
+# import the concrete module directly — the ServerModel package __init__ pulls
+# in every server model (darts, mbv3, ...) and their extra deps, none needed here
+from fedml_api.standalone.superfednas.Server.ServerModel.server_resnet_32x32_10_26 import (  # noqa: E501
     ServerResnet_10_26,
 )
 

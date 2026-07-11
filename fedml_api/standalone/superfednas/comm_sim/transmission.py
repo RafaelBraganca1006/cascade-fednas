@@ -20,6 +20,43 @@ so it is unit-testable next to ``selftest_capacity_aware.py``.
 TX_MODES = ("all_or_nothing", "nested", "nested_shard")
 
 
+def clip_arch_config(arch, tier):
+    """Intersection α ∧ tier of a trained arch with a ladder tier.
+
+    Middle clients under TS_all_random train *arbitrary* elastic archs (per-
+    stage d, per-block e), not the configured tiers — so a client's shell
+    ladder is the tier-clipped version of its own arch: d = min per stage,
+    e = min per block. The result is a valid OFA config, and the clipped
+    ladder is nested by construction:  α∧tier_0 ⊆ α∧tier_1 ⊆ ... ⊆ α.
+    Keys other than d/e (e.g. w) are passed through from the arch.
+    """
+
+    def _min(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return min(a, b)
+
+    def _combine(a_val, t_val):
+        a_list = a_val if isinstance(a_val, (list, tuple)) else None
+        t_list = t_val if isinstance(t_val, (list, tuple)) else None
+        if a_list is not None and t_list is not None:
+            assert len(a_list) == len(t_list), (a_val, t_val)
+            return [_min(x, y) for x, y in zip(a_list, t_list)]
+        if a_list is not None:
+            return [_min(x, t_val) for x in a_list]
+        if t_list is not None:
+            return [_min(a_val, y) for y in t_list]
+        return _min(a_val, t_val)
+
+    clipped = dict(arch)
+    for key in ("d", "e"):
+        if key in arch and key in tier:
+            clipped[key] = _combine(arch[key], tier[key])
+    return clipped
+
+
 class TransmissionPlan:
     """What the server instructs one client to send this round.
 
@@ -95,6 +132,27 @@ class DeliveryReport:
         """True when no complete tier arrived — the client need not train
         (the reduced, still-valid form of the pre-training skip)."""
         return self.delivered_tier < 0
+
+
+def build_clipped_plan(arch_config, tier_configs, payload_bits_fn, order=None):
+    """Build one client's TransmissionPlan: its trained arch α clipped by the
+    tier ladder (see clip_arch_config).
+
+    tier_configs: ladder configs ascending by (unclipped) size — nestedness of
+        the ladder is verified offline by verify_nesting.py, and it implies the
+        clipped ladder is nested/ascending too.
+    payload_bits_fn: config -> payload bits (the trainer passes a closure over
+        server_model.get_subnet + CommSimulator.payload_bits, so the size used
+        to plan matches the size charged at transmit time).
+
+    The top of the clipped ladder is α itself (α ⊆ max tier), so completing
+    the plan delivers exactly the trained update.
+    """
+    tiers = []
+    for tier_cfg in tier_configs:
+        clipped = clip_arch_config(arch_config, tier_cfg)
+        tiers.append((payload_bits_fn(clipped), clipped))
+    return TransmissionPlan(tiers, train_tier=len(tiers) - 1, order=order)
 
 
 def truncate(plan, budget_bits, bandwidth_bps, window_s):

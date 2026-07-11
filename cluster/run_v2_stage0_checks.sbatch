@@ -48,14 +48,17 @@ python fedml_api/standalone/superfednas/comm_sim/verify_nesting.py || exit 1
 
 echo "=== check 2: v2 legacy smoke (20 rounds, all_or_nothing) ==="
 cd "$V2_ROOT/fedml_experiments/standalone/superfednas"
-python train.py "${SMOKE_ARGS[@]}" 2>&1 | tee /tmp/v2_smoke_$SLURM_JOB_ID.log
+set -o pipefail
+python train.py "${SMOKE_ARGS[@]}" 2>&1 | tee /tmp/v2_smoke_$SLURM_JOB_ID.log || {
+  echo "v2 smoke FAILED"; exit 1; }
 grep "\[comm_sim\] round" /tmp/v2_smoke_$SLURM_JOB_ID.log > /tmp/v2_comm_$SLURM_JOB_ID.txt
 echo "--- v2 comm lines: $(wc -l < /tmp/v2_comm_$SLURM_JOB_ID.txt) rounds ---"
 
 if [ -n "$V1_ROOT" ]; then
   echo "=== check 3: v1 reference smoke + diff ==="
   cd "$V1_ROOT/fedml_experiments/standalone/superfednas"
-  python train.py "${SMOKE_ARGS[@]}" 2>&1 | tee /tmp/v1_smoke_$SLURM_JOB_ID.log
+  python train.py "${SMOKE_ARGS[@]}" 2>&1 | tee /tmp/v1_smoke_$SLURM_JOB_ID.log || {
+    echo "v1 reference smoke FAILED"; exit 1; }
   grep "\[comm_sim\] round" /tmp/v1_smoke_$SLURM_JOB_ID.log > /tmp/v1_comm_$SLURM_JOB_ID.txt
   if diff /tmp/v1_comm_$SLURM_JOB_ID.txt /tmp/v2_comm_$SLURM_JOB_ID.txt; then
     echo "STAGE 0 REGRESSION: IDENTICAL — v2 legacy mode reproduces v1"

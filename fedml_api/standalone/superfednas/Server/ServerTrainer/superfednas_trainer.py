@@ -97,6 +97,13 @@ class FLOFA_Trainer(ABC):
                 "[comm_sim] enabled: markov bandwidth, deadline=%.1fs, seed=%d, tx_mode=%s"
                 % (self.args.bw_deadline, self.args.bw_seed, self.comm_sim.tx_mode)
             )
+            if self.comm_sim.tx_mode != "all_or_nothing":
+                assert not getattr(self.args, "feddyn", False), (
+                    "nested transmission not supported with feddyn yet"
+                )
+            # lazy caches for the nested path (see _build_tx_plan / _slice_client_update)
+            self._tier_cfgs = None
+            self._scratch_server = None
 
         self.wt_avg_sched_method = wt_avg_sched_method
         self.weighted_avg_scheduler = dict()
@@ -180,6 +187,50 @@ class FLOFA_Trainer(ABC):
             )
         logging.info("client_indexes = %s" % str(client_indexes))
         return client_indexes
+
+    # ---- dynFedNAS v2: nested anytime transmission (Stage 1) ----
+    def _tier_ladder_configs(self):
+        """Tier ladder from diverse_subnets, ascending by payload (cached).
+        Nestedness of the ladder is verified offline (verify_nesting.py)."""
+        if self._tier_cfgs is None:
+            subnets = self.sampler_args["diverse_subnets"]
+            sized = []
+            for key in subnets:
+                cfg = subnets[key]
+                model = self.server_model.get_subnet(**cfg)
+                sized.append((self.comm_sim.payload_bits(model), cfg))
+            sized.sort(key=lambda t: t[0])
+            self._tier_cfgs = [cfg for _, cfg in sized]
+        return self._tier_cfgs
+
+    def _build_tx_plan(self, arch_config):
+        """One client's shell ladder: its trained arch clipped by each tier.
+        Payloads are sized with the same rule the simulator charges."""
+        from fedml_api.standalone.superfednas.comm_sim.transmission import (
+            build_clipped_plan,
+        )
+
+        return build_clipped_plan(
+            arch_config,
+            self._tier_ladder_configs(),
+            lambda cfg: self.comm_sim.payload_bits(self.server_model.get_subnet(**cfg)),
+        )
+
+    def _slice_client_update(self, trained_model, beta_config):
+        """Extract the delivered tier β ⊆ α from a trained α update.
+
+        Merges the trained update into a scratch supernet copy (the client's
+        avg_weight cancels in single-model _aggregate: sum=w*p, count=w), then
+        cuts the β subnet out of it with the production get_subnet slicing.
+        trained_model must already be on CPU (like _aggregate expects).
+        """
+        if self._scratch_server is None:
+            self._scratch_server = copy.deepcopy(self.server_model)
+        merged = self._aggregate([trained_model])
+        self._scratch_server.set_model_params(merged)
+        beta_model = self._scratch_server.get_subnet(**beta_config)
+        beta_model.set_avg_wt(trained_model.avg_weight)
+        return beta_model
 
     def _aggregate(self, w_locals):
         w_global_max_net = self.server_model.get_model_params()
@@ -317,18 +368,29 @@ class FLOFA_Trainer(ABC):
                 )
                 continue
 
-            # ---- communication simulation: decide the drop BEFORE training ----
-            # A dropped update is excluded from aggregation anyway, and the drop
-            # decision depends only on subnet size + bandwidth (not on the trained
-            # weights). Deciding here lets us skip training for droppers -> identical
-            # model result, ~no wasted compute on updates that will be discarded.
+            # ---- communication simulation: decide the delivery BEFORE training ----
+            # Delivery depends only on subnet size + bandwidth (not the trained
+            # weights), so it can be decided here; a client that delivers nothing
+            # is skipped entirely -> identical model result, no wasted compute.
+            # all_or_nothing: the whole update fits or it is dropped (legacy).
+            # nested(+shard): the upload is the client's clipped shell ladder;
+            # the deadline truncates it and the largest complete tier survives.
+            tx_report = None
             if self.comm_sim is not None:
                 is_max = self.server_model.is_max_net(client_model.model_config)
-                success, _ = self.comm_sim.transmit(
-                    round_num, client_idx, client_model, is_max
-                )
-                if not success:
-                    continue  # update would time out: not trained, not aggregated
+                if self.comm_sim.tx_mode == "all_or_nothing":
+                    success, _ = self.comm_sim.transmit(
+                        round_num, client_idx, client_model, is_max
+                    )
+                    if not success:
+                        continue  # update would time out: not trained, not aggregated
+                else:
+                    plan = self._build_tx_plan(client_model.model_config)
+                    tx_report = self.comm_sim.transmit_plan(
+                        round_num, client_idx, plan, is_max
+                    )
+                    if tx_report.delivers_nothing():
+                        continue  # not even the smallest clipped tier fits
 
             client_model.set_avg_wt(avg_weights[idx])
             cur_model_vec = None
@@ -375,6 +437,23 @@ class FLOFA_Trainer(ABC):
                 )
             # move updated client model to cpu
             updated_cli_model.cpu()
+            # nested transmission: the deadline delivered only tier β ⊂ α —
+            # aggregate the β-slice of the trained weights (anytime property)
+            if tx_report is not None and not tx_report.completed_plan:
+                if self.args.verbose:
+                    logging.info(
+                        "[comm_sim] client %d truncated: trained %s, delivered "
+                        "tier %d %s"
+                        % (
+                            client_idx,
+                            client_model.model_config,
+                            tx_report.delivered_tier,
+                            tx_report.delivered_config,
+                        )
+                    )
+                updated_cli_model = self._slice_client_update(
+                    updated_cli_model, tx_report.delivered_config
+                )
             w_locals.append(updated_cli_model)
         # Multiply weight with dataset size proportion to global dataset size
         # (len(w_locals) may be < client_num_per_round once comm_sim drops updates)

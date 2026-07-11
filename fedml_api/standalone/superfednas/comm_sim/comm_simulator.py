@@ -89,6 +89,7 @@ class CommSimulator:
             "bits_wasted": 0.0,
             "max_success_upload_time": 0.0,
             "incomplete": 0,  # uploads the deadline cut short (drop or truncation)
+            "delivered_tiers": [],  # per transmit_plan client: delivered tier index
         }
 
     def _record(self, client_idx, is_max_net, payload_bits, report):
@@ -142,6 +143,7 @@ class CommSimulator:
         budget, bw = self.upload_budget_bits(client_idx, round_num)
         report = truncate(plan, budget, bw, self.upload_window(client_idx))
         self._record(client_idx, is_max_net, plan.total_bits(), report)
+        self._cur["delivered_tiers"].append(report.delivered_tier)
         return report
 
     def end_round(self):
@@ -177,7 +179,12 @@ class CommSimulator:
             "comm/MB_attempted_total": self.total_bits_attempted / 8e6,
             "comm/MB_wasted_total": self.total_bits_wasted / 8e6,
             "comm/waste_rate": c["bits_wasted"] / max(c["bits_attempted"], 1e-9),
+            "comm/full_plan_rate": (selected - c["incomplete"]) / selected,
         }
+        if c["delivered_tiers"]:
+            summary["comm/mean_delivered_tier"] = sum(c["delivered_tiers"]) / len(
+                c["delivered_tiers"]
+            )
         self.round_records.append({**c, "round_time": round_time})
         self._cur = None
         return summary
