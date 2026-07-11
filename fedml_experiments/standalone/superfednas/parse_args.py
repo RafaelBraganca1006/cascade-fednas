@@ -592,6 +592,17 @@ def add_args(parser):
         "round's true bandwidth (oracle, upper bound) or the previous round's "
         "(lagged, realistic — the estimate can be stale at upload time).",
     )
+    parser.add_argument(
+        "--tx_mode",
+        type=str,
+        default="all_or_nothing",
+        choices=["all_or_nothing", "nested", "nested_shard"],
+        help="Transmission model. all_or_nothing: the whole update fits within "
+        "the deadline or it is dropped (legacy). nested: the upload is a "
+        "shell-ordered stream (S, M\\S, L\\M, ...) the deadline truncates — "
+        "every complete shell prefix is a valid smaller-tier update (anytime). "
+        "nested_shard: nested + top-shell sharding across clients.",
+    )
 
     return parser
 

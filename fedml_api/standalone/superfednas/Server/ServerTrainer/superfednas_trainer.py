@@ -88,10 +88,14 @@ class FLOFA_Trainer(ABC):
                 num_rounds=self.args.comm_round,
                 seed=self.args.bw_seed,
             )
-            self.comm_sim = CommSimulator(bw_model, deadline_s=self.args.bw_deadline)
+            self.comm_sim = CommSimulator(
+                bw_model,
+                deadline_s=self.args.bw_deadline,
+                tx_mode=getattr(self.args, "tx_mode", "all_or_nothing"),
+            )
             logging.info(
-                "[comm_sim] enabled: markov bandwidth, deadline=%.1fs, seed=%d"
-                % (self.args.bw_deadline, self.args.bw_seed)
+                "[comm_sim] enabled: markov bandwidth, deadline=%.1fs, seed=%d, tx_mode=%s"
+                % (self.args.bw_deadline, self.args.bw_seed, self.comm_sim.tx_mode)
             )
 
         self.wt_avg_sched_method = wt_avg_sched_method
