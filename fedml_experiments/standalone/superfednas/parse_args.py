@@ -603,6 +603,22 @@ def add_args(parser):
         "every complete shell prefix is a valid smaller-tier update (anytime). "
         "nested_shard: nested + top-shell sharding across clients.",
     )
+    parser.add_argument(
+        "--no_shard_fallback",
+        action="store_true",
+        help="nested_shard only: disable the sub-floor fallback (clients whose "
+        "budget fits no complete tier upload whole blocks of their own subnet "
+        "instead of dropping). On by default: zero-drop by construction.",
+    )
+    parser.add_argument(
+        "--shard_carriers",
+        type=int,
+        default=2,
+        help="nested_shard only: number of clients per round designated as "
+        "shard carriers (train the full supernet, upload assigned supernet "
+        "blocks in coverage-debt order). Carriers are picked by lagged "
+        "bandwidth (round r-1, no oracle).",
+    )
 
     return parser
 

@@ -241,6 +241,84 @@ def test_monotonicity():
     print("PASS monotonicity")
 
 
+def test_sharding():
+    sh = _load("sharding", "sharding.py")
+
+    # payload table: only block keys count, grouped by block id
+    numels = {
+        "input_stem.0.conv.conv.weight": 100,
+        "blocks.0.conv1.conv.weight": 1000,
+        "blocks.0.bn1.bn.weight": 10,
+        "blocks.1.conv1.conv.weight": 2000,
+        "classifier.linear.linear.weight": 50,
+    }
+    bits = sh.block_payload_bits(numels, bytes_per_param=4)
+    assert bits == {0: 1010 * 32, 1: 2000 * 32}
+
+    # allocator: debt order respected, greedy most-room-first, budgets honored
+    unit_bits = {0: 10, 1: 20, 2: 30, 3: 100}
+    assignment = sh.allocate_units(
+        unit_bits, {"a": 40, "b": 35}, debt_order=[2, 1, 0, 3]
+    )
+    assert assignment["a"] == [2]  # unit 2 -> most room (a: 40)
+    assert assignment["b"] == [1, 0]  # then b has most room (35) for 1, then 0
+    assert 3 not in assignment["a"] + assignment["b"]  # 100 fits nobody
+
+    # wrapper: state_dict filtered to delivered blocks (via model_index)
+    class FakeCM(object):
+        avg_weight = 0.5
+        model_index = {"blocks": {0: 0, 1: 3}}
+        model_config = {"d": [2], "e": 0.25}
+
+        def state_dict(self):
+            return {
+                "blocks.0.conv1.conv.weight": "b0",
+                "blocks.1.conv1.conv.weight": "b1",
+                "blocks.1.bn1.bn.weight": "b1bn",
+                "input_stem.0.conv.conv.weight": "stem",
+                "classifier.linear.weight": "cls",
+            }
+
+    upd = sh.ShardedUpdate(FakeCM(), delivered_block_ids=[3])
+    kept = upd.state_dict()
+    assert set(kept) == {"blocks.1.conv1.conv.weight", "blocks.1.bn1.bn.weight"}
+    assert upd.avg_weight == 0.5
+
+    # client_block_bits: per-block sizes of a SMALL subnet, supernet-keyed
+    class FakeTensor(object):
+        def __init__(self, n):
+            self._n = n
+
+        def numel(self):
+            return self._n
+
+    class FakeSmallCM(object):
+        model_index = {"blocks": {0: 0, 1: 5}}
+
+        def state_dict(self):
+            return {
+                "blocks.0.conv1.conv.weight": FakeTensor(100),
+                "blocks.0.bn1.bn.weight": FakeTensor(10),
+                "blocks.1.conv1.conv.weight": FakeTensor(200),
+                "input_stem.0.conv.conv.weight": FakeTensor(999),
+            }
+
+    bb = sh.client_block_bits(FakeSmallCM(), bytes_per_param=4)
+    assert bb == {0: 110 * 32, 5: 200 * 32}
+
+    # unit truncation: whole units only, cut unit = waste
+    plan = tx.ShardPlan([(7, 10 * MBIT), (3, 20 * MBIT), (9, 30 * MBIT)])
+    r, ids = tx.truncate_units(plan, 35 * MBIT, 10 * MBIT, 20.0)
+    assert ids == [7, 3]
+    assert abs(r.bits_delivered - 30 * MBIT) < 1e-9
+    assert abs(r.bits_wasted - 5 * MBIT) < 1e-9 and not r.completed_plan
+    r, ids = tx.truncate_units(plan, 60 * MBIT, 10 * MBIT, 20.0)
+    assert ids == [7, 3, 9] and r.completed_plan and r.bits_wasted == 0
+    r, ids = tx.truncate_units(plan, 5 * MBIT, 10 * MBIT, 20.0)
+    assert ids == [] and r.delivers_nothing()
+    print("PASS sharding (payload table, allocator, wrapper, unit truncation)")
+
+
 def test_nested_sim_accounting():
     deadline = 20.0
     # client 0: 10 Mbps x 20 s = 200 Mbit budget -> full 64 Mbit plan
@@ -274,5 +352,6 @@ if __name__ == "__main__":
     test_build_clipped_plan()
     test_saturating_ladder()
     test_monotonicity()
+    test_sharding()
     test_nested_sim_accounting()
     print("ALL TRANSMISSION SELF-TESTS PASSED")

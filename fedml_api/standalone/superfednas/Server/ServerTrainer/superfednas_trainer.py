@@ -104,6 +104,9 @@ class FLOFA_Trainer(ABC):
             # lazy caches for the nested path (see _build_tx_plan / _slice_client_update)
             self._tier_cfgs = None
             self._scratch_server = None
+            # lazy caches for the shard path (see _allocate_shards)
+            self._unit_bits = None
+            self._unit_last_round = None
 
         self.wt_avg_sched_method = wt_avg_sched_method
         self.weighted_avg_scheduler = dict()
@@ -232,6 +235,81 @@ class FLOFA_Trainer(ABC):
         beta_model.set_avg_wt(trained_model.avg_weight)
         return beta_model
 
+    @staticmethod
+    def _tier_name(subnet_info):
+        """Clean wandb alias (tier_S..tier_XL) for the monitored uniform-e tier
+        configs; None for arbitrary archs (which keep only the dict-keyed logs)."""
+        e = subnet_info.get("e")
+        if isinstance(e, (list, tuple)):
+            e = e[0] if len(set(e)) == 1 else None
+        return {0.1: "tier_S", 0.14: "tier_M", 0.18: "tier_L", 0.25: "tier_XL"}.get(e)
+
+    def _log_tier_alias(self, subnet_info, test_acc, round_idx, tier_test_accs):
+        tier = self._tier_name(subnet_info)
+        if tier is not None:
+            wandb.log(
+                {f"Test/{tier}/Acc": test_acc, "round": round_idx}, step=round_idx
+            )
+            tier_test_accs[tier] = test_acc
+
+    @staticmethod
+    def _log_spread(tier_test_accs, round_idx):
+        """Test/spread = XL - S accuracy: the Pareto-compression scalar."""
+        if "tier_XL" in tier_test_accs and "tier_S" in tier_test_accs:
+            wandb.log(
+                {
+                    "Test/spread": tier_test_accs["tier_XL"] - tier_test_accs["tier_S"],
+                    "round": round_idx,
+                },
+                step=round_idx,
+            )
+
+    def _allocate_shards(self, round_num, client_indexes):
+        """Shard-carrier allocation for this round (nested_shard mode).
+
+        Mechanism-default policy (pre-Lyapunov placeholder): pick the
+        --shard_carriers clients with the highest *lagged* bandwidth (round
+        r-1 — honest, no oracle), give each an estimated budget, and assign
+        shard units (whole supernet blocks) greedily in coverage-debt order
+        (least recently delivered first). A mis-estimate costs coverage this
+        round, never correctness. Returns {client_idx: [unit ids]}.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.sharding import (
+            allocate_units,
+            block_payload_bits,
+        )
+
+        if self._unit_bits is None:
+            numels = {
+                k: v.numel() for k, v in self.server_model.get_model_params().items()
+            }
+            self._unit_bits = block_payload_bits(
+                numels, self.comm_sim.bytes_per_param
+            )
+            self._unit_last_round = {u: -1 for u in self._unit_bits}
+            logging.info(
+                "[comm_sim] shard units: %d blocks, %.1f MB total"
+                % (
+                    len(self._unit_bits),
+                    sum(self._unit_bits.values()) / 8e6,
+                )
+            )
+        num_carriers = getattr(self.args, "shard_carriers", 2)
+        if num_carriers <= 0:
+            return {}  # tables above stay initialized for the shard fallback
+        bw_round = max(round_num - 1, 0)
+        est = {
+            cli: self.comm_sim.bw.bandwidth(cli, bw_round) for cli in client_indexes
+        }
+        carriers = sorted(est, key=est.get, reverse=True)[:num_carriers]
+        budgets = {
+            c: est[c] * self.comm_sim.upload_window(c) for c in carriers
+        }
+        debt_order = sorted(
+            self._unit_bits, key=lambda u: (self._unit_last_round[u], u)
+        )
+        return allocate_units(self._unit_bits, budgets, debt_order)
+
     def _aggregate(self, w_locals):
         w_global_max_net = self.server_model.get_model_params()
         shared_param_count = dict()
@@ -331,6 +409,11 @@ class FLOFA_Trainer(ABC):
         training_samples = []
         if self.comm_sim is not None:
             self.comm_sim.start_round(round_num)
+        # nested_shard: designate carriers that train the full supernet and
+        # upload assigned shard units of the starving region (collective upload)
+        shard_assignment = {}
+        if self.comm_sim is not None and self.comm_sim.tx_mode == "nested_shard":
+            shard_assignment = self._allocate_shards(round_num, client_indexes)
 
         for idx in range(self.args.client_num_per_round):
             # update dataset
@@ -376,21 +459,83 @@ class FLOFA_Trainer(ABC):
             # nested(+shard): the upload is the client's clipped shell ladder;
             # the deadline truncates it and the largest complete tier survives.
             tx_report = None
+            delivered_units = None
             if self.comm_sim is not None:
-                is_max = self.server_model.is_max_net(client_model.model_config)
-                if self.comm_sim.tx_mode == "all_or_nothing":
+                carrier_units = shard_assignment.get(client_idx)
+                if carrier_units:
+                    # carrier: train the full supernet, upload ONLY the
+                    # assigned shard units (its sampled subnet is overridden —
+                    # the units require an XL-context update to exist)
+                    from fedml_api.standalone.superfednas.comm_sim.transmission import (
+                        ShardPlan,
+                    )
+
+                    client_model = self.server_model.get_subnet(
+                        **self.server_model.max_subnet_arch()
+                    )
+                    plan = ShardPlan(
+                        [(u, self._unit_bits[u]) for u in carrier_units]
+                    )
+                    # carriers are accounted with is_max_net=False: max_present/
+                    # max_failed keep their sampler-slot meaning across arms
+                    tx_report, delivered_units = self.comm_sim.transmit_shards(
+                        round_num, client_idx, plan, is_max_net=False
+                    )
+                    if not delivered_units:
+                        continue  # nothing fits: not trained, not aggregated
+                elif self.comm_sim.tx_mode == "all_or_nothing":
+                    is_max = self.server_model.is_max_net(client_model.model_config)
                     success, _ = self.comm_sim.transmit(
                         round_num, client_idx, client_model, is_max
                     )
                     if not success:
                         continue  # update would time out: not trained, not aggregated
                 else:
+                    is_max = self.server_model.is_max_net(client_model.model_config)
                     plan = self._build_tx_plan(client_model.model_config)
-                    tx_report = self.comm_sim.transmit_plan(
-                        round_num, client_idx, plan, is_max
-                    )
-                    if tx_report.delivers_nothing():
-                        continue  # not even the smallest clipped tier fits
+                    # fallback decision uses the LAGGED bandwidth (round r-1,
+                    # same honesty as carrier selection): plan choices are
+                    # ex-ante and may not use this round's true bandwidth.
+                    # A mis-guess degrades gracefully either way; the actual
+                    # delivery below is still truncated ex-post by the truth.
+                    est_budget = self.comm_sim.bw.bandwidth(
+                        client_idx, max(round_num - 1, 0)
+                    ) * self.comm_sim.upload_window(client_idx)
+                    if (
+                        self.comm_sim.tx_mode == "nested_shard"
+                        and not getattr(self.args, "no_shard_fallback", False)
+                        and est_budget < plan.tiers[0][0]
+                    ):
+                        # sub-floor fallback: no complete tier fits this budget —
+                        # upload whole blocks of the client's own subnet instead
+                        # (collective aggregation rule; debt-ordered). Turns the
+                        # residual all-or-nothing drops into partial contributions.
+                        from fedml_api.standalone.superfednas.comm_sim.sharding import (
+                            client_block_bits,
+                        )
+                        from fedml_api.standalone.superfednas.comm_sim.transmission import (
+                            ShardPlan,
+                        )
+
+                        blk = client_block_bits(
+                            client_model, self.comm_sim.bytes_per_param
+                        )
+                        order = sorted(
+                            blk,
+                            key=lambda u: (self._unit_last_round.get(u, -1), u),
+                        )
+                        fb_plan = ShardPlan([(u, blk[u]) for u in order])
+                        tx_report, delivered_units = self.comm_sim.transmit_shards(
+                            round_num, client_idx, fb_plan, is_max
+                        )
+                        if not delivered_units:
+                            continue  # budget below a single block: nothing fits
+                    else:
+                        tx_report = self.comm_sim.transmit_plan(
+                            round_num, client_idx, plan, is_max
+                        )
+                        if tx_report.delivers_nothing():
+                            continue  # not even the smallest clipped tier fits
 
             client_model.set_avg_wt(avg_weights[idx])
             cur_model_vec = None
@@ -437,6 +582,22 @@ class FLOFA_Trainer(ABC):
                 )
             # move updated client model to cpu
             updated_cli_model.cpu()
+            # shard carrier: aggregate only the delivered units of the XL update
+            if delivered_units is not None:
+                from fedml_api.standalone.superfednas.comm_sim.sharding import (
+                    ShardedUpdate,
+                )
+
+                for unit in delivered_units:
+                    self._unit_last_round[unit] = round_num
+                if self.args.verbose:
+                    role = "carrier" if carrier_units else "fallback"
+                    logging.info(
+                        "[comm_sim] %s %d delivered %d shard units"
+                        % (role, client_idx, len(delivered_units))
+                    )
+                w_locals.append(ShardedUpdate(updated_cli_model, delivered_units))
+                continue
             # nested transmission: the deadline delivered only tier β ⊂ α —
             # aggregate the β-slice of the trained weights (anytime property)
             if tx_report is not None and not tx_report.completed_plan:
@@ -466,6 +627,10 @@ class FLOFA_Trainer(ABC):
                 )
         if self.comm_sim is not None:
             comm_summary = self.comm_sim.end_round()
+            if self.comm_sim.tx_mode == "nested_shard" and self._unit_bits:
+                comm_summary["comm/shard_coverage"] = comm_summary.get(
+                    "comm/shard_units_delivered", 0
+                ) / len(self._unit_bits)
             if self.args.subnet_dist_type == "capacity_aware":
                 comm_summary["capacity/num_clamped"] = (
                     self.server_model.cap_num_clamped
@@ -591,6 +756,7 @@ class FLOFA_Trainer(ABC):
         }
         subnet_test_acc_map = dict()
         subnet_train_acc_map = dict()
+        tier_test_accs = dict()  # clean-alias tier accs for the S/M/L/XL probes
         for subnet_id in self.args.diverse_subnets:
             subnet_info = self.args.diverse_subnets[subnet_id]
             train_metrics = {
@@ -718,9 +884,11 @@ class FLOFA_Trainer(ABC):
                 {f"Test/{wandb_subnet_log}/Loss": test_loss, "round": round_idx,},
                 step=round_idx,
             )
+            self._log_tier_alias(subnet_info, test_acc, round_idx, tier_test_accs)
             logging.info(stats)
             subnet_test_acc_map[subnet_id] = stats["test_acc"]
 
+        self._log_spread(tier_test_accs, round_idx)
         final_train_acc = sum(avg_subnet_train_metrics["num_correct"]) / sum(
             avg_subnet_train_metrics["num_samples"]
         )
@@ -774,6 +942,7 @@ class FLOFA_Trainer(ABC):
 
         subnet_train_acc_map = dict()
         subnet_test_acc_map = dict()
+        tier_test_accs = dict()  # clean-alias tier accs for the S/M/L/XL probes
 
         for subnet_id in self.args.diverse_subnets:
             subnet_info = self.args.diverse_subnets[subnet_id]
@@ -960,9 +1129,11 @@ class FLOFA_Trainer(ABC):
                     {f"Test/{wandb_subnet_log}/Loss": test_loss, "round": round_idx,},
                     step=round_idx,
                 )
+                self._log_tier_alias(subnet_info, test_acc, round_idx, tier_test_accs)
                 logging.info(stats)
                 subnet_test_acc_map[subnet_id] = stats["test_acc"]
 
+        self._log_spread(tier_test_accs, round_idx)
         if self.args.dataset == 'ptb':
             if not self.args.skip_train_test:
                 # test on train dataset

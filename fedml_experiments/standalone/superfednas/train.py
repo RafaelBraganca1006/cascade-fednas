@@ -506,7 +506,9 @@ if __name__ == "__main__":
     wandb.init(
         project=args.wandb_project_name,
         name=args.wandb_run_name,
-        entity=args.wandb_entity,
+        # "none" (the sweep scripts' placeholder) must not become a literal
+        # entity name — None lets wandb use the logged-in account's default
+        entity=None if args.wandb_entity in ("none", "") else args.wandb_entity,
         config=args,
     )
 

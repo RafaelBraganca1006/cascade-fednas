@@ -90,6 +90,7 @@ class CommSimulator:
             "max_success_upload_time": 0.0,
             "incomplete": 0,  # uploads the deadline cut short (drop or truncation)
             "delivered_tiers": [],  # per transmit_plan client: delivered tier index
+            "units_delivered": 0,  # shard units delivered by carriers this round
         }
 
     def _record(self, client_idx, is_max_net, payload_bits, report):
@@ -146,6 +147,19 @@ class CommSimulator:
         self._cur["delivered_tiers"].append(report.delivered_tier)
         return report
 
+    def transmit_shards(self, round_num, client_idx, shard_plan, is_max_net=False):
+        """Carrier upload (nested_shard mode): whole shard units until the
+        budget runs out. Returns (DeliveryReport, delivered unit ids)."""
+        from .transmission import truncate_units
+
+        budget, bw = self.upload_budget_bits(client_idx, round_num)
+        report, delivered = truncate_units(
+            shard_plan, budget, bw, self.upload_window(client_idx)
+        )
+        self._record(client_idx, is_max_net, shard_plan.total_bits(), report)
+        self._cur["units_delivered"] += len(delivered)
+        return report, delivered
+
     def end_round(self):
         """Finalize the round, advance wall-clock, return a summary dict."""
         c = self._cur
@@ -185,6 +199,8 @@ class CommSimulator:
             summary["comm/mean_delivered_tier"] = sum(c["delivered_tiers"]) / len(
                 c["delivered_tiers"]
             )
+        if c["units_delivered"]:
+            summary["comm/shard_units_delivered"] = c["units_delivered"]
         self.round_records.append({**c, "round_time": round_time})
         self._cur = None
         return summary

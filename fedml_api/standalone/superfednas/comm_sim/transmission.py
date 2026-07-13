@@ -134,6 +134,57 @@ class DeliveryReport:
         return self.delivered_tier < 0
 
 
+class ShardPlan:
+    """A carrier client's upload: whole supernet *blocks* at full width.
+
+    Stage 3 sharding works at block granularity: a unit is one supernet block
+    id, and carrying it means uploading that block's full-width parameters
+    (convs + bns) from an XL-trained update. Units are independent — unlike
+    shells there is no prefix semantics; each unit that fits the budget is
+    individually usable, because aggregation is a per-coordinate average and
+    the rest of the supernet keeps its coverage from the shell path.
+
+    units: list of (unit_id, payload_bits) in send order (the allocator
+    orders them by coverage debt, most-starved first).
+    """
+
+    def __init__(self, units):
+        assert len(units) > 0
+        self.units = list(units)
+
+    def total_bits(self):
+        return sum(bits for _, bits in self.units)
+
+
+def truncate_units(plan, budget_bits, bandwidth_bps, window_s):
+    """Cut a ShardPlan at the upload budget: whole units count, a half-sent
+    unit is wire waste. Returns (DeliveryReport, delivered_unit_ids)."""
+    remaining = max(float(budget_bits), 0.0)
+    attempted = 0.0
+    delivered_bits = 0.0
+    delivered_ids = []
+    for unit_id, bits in plan.units:
+        if bits <= remaining:
+            delivered_ids.append(unit_id)
+            delivered_bits += bits
+            attempted += bits
+            remaining -= bits
+        else:
+            attempted += remaining
+            remaining = 0.0
+            break
+    time_used = attempted / bandwidth_bps if bandwidth_bps > 0 else float(window_s)
+    report = DeliveryReport(
+        delivered_tier=0 if delivered_ids else -1,
+        delivered_config=None,
+        bits_attempted=attempted,
+        bits_delivered=delivered_bits,
+        time_used=min(time_used, float(window_s)),
+        completed_plan=len(delivered_ids) == len(plan.units),
+    )
+    return report, delivered_ids
+
+
 def build_clipped_plan(arch_config, tier_configs, payload_bits_fn, order=None):
     """Build one client's TransmissionPlan: its trained arch α clipped by the
     tier ladder (see clip_arch_config).
