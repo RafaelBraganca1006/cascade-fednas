@@ -41,7 +41,7 @@ else
   echo "=== pareto search | tag=$TAG | SHORT budget (T=5, pop=15) — smoke test ==="
 fi
 
-python search_phase.py --ckpt "$CKPT" --mode pareto \
+python -u search_phase.py --ckpt "$CKPT" --mode pareto \
   --constraints 0.5 1.0 1.5 2.5 3.5 \
   --bn_recal_batches 0 \
   --fitness_batches 10 \
