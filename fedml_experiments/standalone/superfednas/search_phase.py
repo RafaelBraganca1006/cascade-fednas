@@ -84,11 +84,14 @@ def cache_batches(loader, num_batches):
     return batches
 
 
-def eval_arch(server_model, arch, test_loader, device, recal_batches):
+def eval_arch(server_model, arch, test_loader, device, recal_batches, max_batches=None):
     subnet = server_model.get_subnet(**arch)
     if recal_batches:
         set_running_statistics(subnet.model, recal_batches)
-    metrics = test(subnet.model, test_loader, device)
+    loader = test_loader
+    if max_batches is not None:
+        loader = [b for i, b in enumerate(test_loader) if i < max_batches]
+    metrics = test(subnet.model, loader, device)
     return metrics["test_correct"] / metrics["test_total"]
 
 
@@ -104,6 +107,10 @@ def main():
                     help="pareto search fitness data (test = anchor protocol)")
     ap.add_argument("--bn_recal_batches", type=int, default=30,
                     help="train batches for BN recalibration (0 disables)")
+    ap.add_argument("--fitness_batches", type=int, default=10,
+                    help="test batches used as fitness proxy during pareto evolution "
+                         "(matches SuperFedNAS original; 0 = full test set). "
+                         "Winner is always re-evaluated on the full test set.")
     ap.add_argument("--seed", type=int, default=0)
     # evolution knobs (nas_flop reads these off args)
     ap.add_argument("--max_time_budget", type=int, default=20)
@@ -126,7 +133,7 @@ def main():
     dataset = load_data(args, args.dataset)
     train_global, test_global, num_classes = dataset[2], dataset[3], dataset[7]
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     server_model = custom_ofa_net(
         ckpt["supernet_class"], num_classes, ckpt["supernet_config"], args
     )
@@ -152,12 +159,19 @@ def main():
             gflops = get_flops(server_model, arch)[0] / 10e8
             acc = eval_arch(server_model, arch, test_global, device, recal_batches)
             print("[%d/%d] %.2f GFLOPS acc=%.4f" % (i + 1, args.pop, gflops, acc))
-            rows.append(("population", json.dumps(arch), gflops, acc))
+            rows.append(("population", json.dumps(arch, default=int), gflops, acc))
 
     elif args.mode == "pareto":
         fitness_loader = test_global if args.fitness == "test" else train_global
+        fitness_batches = args.fitness_batches if args.fitness_batches > 0 else None
+        fitness_proxy = (
+            [b for i, b in enumerate(fitness_loader) if i < fitness_batches]
+            if fitness_batches is not None else fitness_loader
+        )
+        print("pareto fitness proxy: %s batches (winner re-evaluated on full test set)"
+              % (fitness_batches if fitness_batches else "all"))
         for constraint in args.constraints:
-            _, best = nas_flop(server_model, fitness_loader, device, constraint, args)
+            _, best = nas_flop(server_model, fitness_proxy, device, constraint, args)
             if best is None:
                 print("constraint %.2f: no feasible individual" % constraint)
                 continue
@@ -167,7 +181,7 @@ def main():
             acc = eval_arch(server_model, arch, test_global, device, recal_batches)
             print("constraint %.2f: %.2f GFLOPS fit=%.4f test=%.4f %s"
                   % (constraint, gflops, acc_fit, acc, arch))
-            rows.append(("pareto@%.2f" % constraint, json.dumps(arch), gflops, acc))
+            rows.append(("pareto@%.2f" % constraint, json.dumps(arch, default=int), gflops, acc))
 
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)

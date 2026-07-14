@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=08:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=search_%j.out
@@ -37,10 +37,13 @@ cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
 
 echo "=== search phase | ckpt=$CKPT tag=$TAG ==="
 python search_phase.py --ckpt "$CKPT" --mode tiers \
+  --bn_recal_batches 0 \
   --out "$OUTDIR/search_${TAG}_tiers.csv" || exit 1
 python search_phase.py --ckpt "$CKPT" --mode population --pop 100 \
+  --bn_recal_batches 0 \
   --out "$OUTDIR/search_${TAG}_population.csv" || exit 1
 python search_phase.py --ckpt "$CKPT" --mode pareto \
   --constraints 0.2 0.4 0.8 1.6 3.2 \
+  --bn_recal_batches 0 \
   --out "$OUTDIR/search_${TAG}_pareto.csv" || exit 1
 echo "=== search phase done: search_${TAG}_{tiers,population,pareto}.csv ==="
