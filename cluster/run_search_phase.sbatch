@@ -43,7 +43,7 @@ python -u search_phase.py --ckpt "$CKPT" --mode population --pop 100 \
   --bn_recal_batches 0 \
   --out "$OUTDIR/search_${TAG}_population.csv" || exit 1
 python -u search_phase.py --ckpt "$CKPT" --mode pareto \
-  --constraints 0.2 0.4 0.8 1.6 3.2 \
+  --constraints 1.0 1.5 2.0 2.5 3.5 \
   --bn_recal_batches 0 \
   --out "$OUTDIR/search_${TAG}_pareto.csv" || exit 1
 echo "=== search phase done: search_${TAG}_{tiers,population,pareto}.csv ==="

@@ -42,7 +42,7 @@ else
 fi
 
 python -u search_phase.py --ckpt "$CKPT" --mode pareto \
-  --constraints 0.5 1.0 1.5 2.5 3.5 \
+  --constraints 1.0 1.5 2.0 2.5 3.5 \
   --bn_recal_batches 0 \
   --fitness_batches 10 \
   --max_time_budget "$TIME_BUDGET" \
