@@ -279,12 +279,15 @@ def nas_flop(supernet, dataset, device, constraint, args):
             best_info = parents[0]
         else:
             best_valids.append(best_valids[-1])
-        wandb.log(
-            {
-                f"NAS Evolution {constraint} GFLOPs Constraint": best_valids[-1],
-                "generation": gen,
-            },
-        )
+        # search_phase.py drives nas_flop without a wandb run (offline Pareto
+        # search); only log when a run exists (training-time usage).
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    f"NAS Evolution {constraint} GFLOPs Constraint": best_valids[-1],
+                    "generation": gen,
+                },
+            )
 
         population = parents
         child_pool = []
