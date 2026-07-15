@@ -351,13 +351,17 @@ class FLOFA_Trainer(ABC):
             s = self.comm_sim.summary()
             logging.info(
                 "[comm_sim] run summary: drop_rate=%.3f max_subnet_failure_rate=%.3f "
-                "wall_clock=%.1fs total_MB_sent=%.1f total_MB_dropped=%.1f"
+                "wall_clock=%.1fs total_MB_sent=%.1f total_MB_dropped=%.1f "
+                "total_MB_attempted=%.1f total_MB_wasted=%.1f waste_rate=%.3f"
                 % (
                     s["comm/overall_drop_rate"],
                     s["comm/max_subnet_failure_rate"],
                     s["comm/final_wall_clock_s"],
                     s["comm/total_MB_sent"],
                     s["comm/total_MB_dropped"],
+                    s["comm/total_MB_attempted"],
+                    s["comm/total_MB_wasted"],
+                    s["comm/overall_waste_rate"],
                 )
             )
             for _k in (
@@ -646,9 +650,14 @@ class FLOFA_Trainer(ABC):
                     self.server_model.cap_num_clamped,
                     self.server_model.cap_max_infeasible,
                 )
+            # Cumulative totals on every round line so accuracy-vs-delivered-GB
+            # curves can be joined on round from the .out alone (DIRECTION §5;
+            # parse_runs.py matches this format).
             logging.info(
                 "[comm_sim] round %d: participation=%.2f dropped=%d/%d "
-                "max_subnet_present=%d max_subnet_failed=%d MB_sent=%.1f%s"
+                "max_subnet_present=%d max_subnet_failed=%d MB_sent=%.1f "
+                "MB_delivered_total=%.1f MB_attempted_total=%.1f "
+                "MB_wasted_total=%.1f wall_clock_s=%.1f%s"
                 % (
                     round_num,
                     comm_summary["comm/participation_rate"],
@@ -657,6 +666,10 @@ class FLOFA_Trainer(ABC):
                     comm_summary["comm/max_subnet_present"],
                     comm_summary["comm/max_subnet_failed"],
                     comm_summary["comm/MB_sent_round"],
+                    comm_summary["comm/MB_sent_total"],
+                    comm_summary["comm/MB_attempted_total"],
+                    comm_summary["comm/MB_wasted_total"],
+                    comm_summary["comm/wall_clock_s"],
                     capacity_note,
                 )
             )
