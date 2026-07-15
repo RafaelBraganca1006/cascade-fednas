@@ -81,21 +81,56 @@ class FLOFA_Trainer(ABC):
             from fedml_api.standalone.superfednas.comm_sim import (
                 CommSimulator,
                 MarkovBandwidth,
+                assign_connectivity_tiers,
             )
 
-            bw_model = MarkovBandwidth.default(
-                num_clients=self.args.client_num_in_total,
-                num_rounds=self.args.comm_round,
-                seed=self.args.bw_seed,
-            )
+            if getattr(self.args, "bw_profile", "uniform") == "tiered":
+                # Heterogeneous connectivity (E4): persistent per-client
+                # profiles, optionally correlated with the client's label
+                # distribution (--bw_data_corr, digital-divide stress test).
+                cls_counts = self._client_class_counts()
+                client_tiers = assign_connectivity_tiers(
+                    cls_counts,
+                    corr=getattr(self.args, "bw_data_corr", 0.0),
+                    seed=self.args.bw_seed,
+                )
+                bw_model = MarkovBandwidth.tiered(
+                    num_clients=self.args.client_num_in_total,
+                    num_rounds=self.args.comm_round,
+                    client_tiers=client_tiers,
+                    seed=self.args.bw_seed,
+                )
+                by_tier = {
+                    name: [c for c, t in enumerate(client_tiers) if t == i]
+                    for i, name in enumerate(MarkovBandwidth.TIER_NAMES)
+                }
+                logging.info(
+                    "[comm_sim] connectivity tiers (corr=%.2f): %s"
+                    % (getattr(self.args, "bw_data_corr", 0.0), by_tier)
+                )
+                logging.info(
+                    "[comm_sim] client dominant classes: %s"
+                    % {c: int(np.argmax(cls_counts[c])) for c in sorted(cls_counts)}
+                )
+            else:
+                bw_model = MarkovBandwidth.default(
+                    num_clients=self.args.client_num_in_total,
+                    num_rounds=self.args.comm_round,
+                    seed=self.args.bw_seed,
+                )
             self.comm_sim = CommSimulator(
                 bw_model,
                 deadline_s=self.args.bw_deadline,
                 tx_mode=getattr(self.args, "tx_mode", "all_or_nothing"),
             )
             logging.info(
-                "[comm_sim] enabled: markov bandwidth, deadline=%.1fs, seed=%d, tx_mode=%s"
-                % (self.args.bw_deadline, self.args.bw_seed, self.comm_sim.tx_mode)
+                "[comm_sim] enabled: markov bandwidth (%s), deadline=%.1fs, seed=%d, tx_mode=%s"
+                % (
+                    getattr(self.args, "bw_profile", "uniform"),
+                    self.args.bw_deadline,
+                    self.args.bw_seed,
+                    self.comm_sim.tx_mode,
+                )
             )
             if self.comm_sim.tx_mode != "all_or_nothing":
                 assert not getattr(self.args, "feddyn", False), (
@@ -259,6 +294,72 @@ class FLOFA_Trainer(ABC):
             wandb.log(
                 {
                     "Test/spread": tier_test_accs["tier_XL"] - tier_test_accs["tier_S"],
+                    "round": round_idx,
+                },
+                step=round_idx,
+            )
+
+    def _client_class_counts(self):
+        """Per-client label histogram from the local train loaders (one pass at
+        init; feeds the bandwidth-data correlation lever, E4)."""
+        counts = {}
+        for c, loader in self.train_data_local_dict.items():
+            cnt = None
+            for _, y in loader:
+                y = y.view(-1).cpu().numpy().astype(int)
+                m = int(y.max()) + 1
+                if cnt is None:
+                    cnt = np.zeros(m, dtype=np.int64)
+                elif m > len(cnt):
+                    cnt = np.concatenate([cnt, np.zeros(m - len(cnt), dtype=np.int64)])
+                cnt += np.bincount(y, minlength=len(cnt))
+            counts[c] = cnt if cnt is not None else np.zeros(1, dtype=np.int64)
+        width = max(len(v) for v in counts.values())
+        return {
+            c: np.concatenate([v, np.zeros(width - len(v), dtype=np.int64)])
+            for c, v in counts.items()
+        }
+
+    def _log_per_class_acc(self, round_idx):
+        """Per-class test accuracy of each monitored tier probe on the global
+        test set (--log_per_class). Feeds the class x method heatmap and the
+        per-class-hole analysis under bandwidth-data correlation (E4). One
+        compact parseable line per tier + wandb series."""
+        if not getattr(self.args, "log_per_class", False):
+            return
+        device = self.client_trainer.device
+        for subnet_arch in self.args.ckpt_subnets:
+            tier = self._tier_name(subnet_arch) or str(subnet_arch)
+            model = self.server_model.get_subnet(**subnet_arch)
+            model.to(device)
+            model.eval()
+            correct, total = None, None
+            with torch.no_grad():
+                for x, y in self.test_global:
+                    x, y = x.to(device), y.view(-1).to(device)
+                    pred = model(x).argmax(dim=1)
+                    if correct is None:
+                        num_cls = int(
+                            max(model(x[:1]).shape[1], int(y.max()) + 1)
+                        )
+                        correct = torch.zeros(num_cls, device=device)
+                        total = torch.zeros(num_cls, device=device)
+                    total += torch.bincount(y, minlength=len(total)).float()
+                    total_hits = y[pred == y]
+                    correct += torch.bincount(
+                        total_hits, minlength=len(correct)
+                    ).float()
+            acc = (correct / total.clamp(min=1)).cpu().numpy()
+            logging.info(
+                "[per_class] round %d %s acc=%s"
+                % (round_idx, tier, np.round(acc, 4).tolist())
+            )
+            wandb.log(
+                {
+                    **{
+                        f"Test/{tier}/class_{k}_acc": float(acc[k])
+                        for k in range(len(acc))
+                    },
                     "round": round_idx,
                 },
                 step=round_idx,
@@ -703,6 +804,7 @@ class FLOFA_Trainer(ABC):
                 self._efficient_local_test_on_all_clients(round_num)
             else:
                 self._local_test_on_all_clients(round_num)
+            self._log_per_class_acc(round_num)
         # per {frequency_of_the_test} round
         elif round_num % self.args.frequency_of_the_test == 0:
             if self.args.efficient_test:
@@ -711,6 +813,7 @@ class FLOFA_Trainer(ABC):
                 )
             else:
                 _, subnet_test_acc_map = self._local_test_on_all_clients(round_num)
+            self._log_per_class_acc(round_num)
             mean_acc = 0.0
             for subnet_arch in self.args.ckpt_subnets:
                 self.client_trainer.set_test_model(

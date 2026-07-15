@@ -43,17 +43,29 @@ class MarkovBandwidth(BandwidthModel):
     seed : int
     """
 
-    def __init__(self, num_clients, num_rounds, states_bps, transition, seed=0):
+    def __init__(self, num_clients, num_rounds, states_bps, transition, seed=0,
+                 per_client_transition=None, client_tiers=None):
         self.states = np.asarray(states_bps, dtype=float)
-        P = np.asarray(transition, dtype=float)
         num_states = len(self.states)
-        assert P.shape == (num_states, num_states), "transition must be SxS"
-        assert np.allclose(P.sum(axis=1), 1.0), "transition rows must sum to 1"
 
+        def _check(P):
+            P = np.asarray(P, dtype=float)
+            assert P.shape == (num_states, num_states), "transition must be SxS"
+            assert np.allclose(P.sum(axis=1), 1.0), "transition rows must sum to 1"
+            return P
+
+        if per_client_transition is not None:
+            assert len(per_client_transition) == num_clients
+            matrices = [_check(P) for P in per_client_transition]
+        else:
+            matrices = [_check(transition)] * num_clients
+
+        self.client_tiers = client_tiers  # None, or per-client profile index
         self.num_clients = num_clients
         self.num_rounds = num_rounds
         self._traj = np.zeros((num_clients, num_rounds), dtype=np.int64)
         for c in range(num_clients):
+            P = matrices[c]
             rng = np.random.default_rng([seed, c])  # independent per client
             s = int(rng.integers(num_states))       # random initial state
             for r in range(num_rounds):
@@ -83,6 +95,81 @@ class MarkovBandwidth(BandwidthModel):
             [0.10, 0.40, 0.50],  # from bad (sticky)
         ]
         return cls(num_clients, num_rounds, states_bps, transition, seed=seed)
+
+    # Connectivity profiles for the heterogeneous ("tiered") setting: same
+    # bandwidth states, different dwell dynamics. Tier 0 = persistently poor
+    # (rural / congested — mostly 2 Mbps), 1 = average (the .default matrix),
+    # 2 = good (mostly 50 Mbps). Persistent per-client quality is what makes
+    # the inclusion-gap and bandwidth-data correlation experiments possible;
+    # .default has identical statistics for every client so no client is
+    # persistently disadvantaged.
+    TIER_NAMES = ("poor", "average", "good")
+    TIER_TRANSITIONS = (
+        [  # poor: sticky-bad
+            [0.30, 0.40, 0.30],
+            [0.10, 0.50, 0.40],
+            [0.05, 0.25, 0.70],
+        ],
+        [  # average: the .default dynamics
+            [0.80, 0.15, 0.05],
+            [0.30, 0.50, 0.20],
+            [0.10, 0.40, 0.50],
+        ],
+        [  # good: sticky-good
+            [0.90, 0.08, 0.02],
+            [0.50, 0.40, 0.10],
+            [0.30, 0.40, 0.30],
+        ],
+    )
+
+    @classmethod
+    def tiered(cls, num_clients, num_rounds, client_tiers, seed=0):
+        """Heterogeneous connectivity: ``client_tiers[c]`` picks each client's
+        profile (0=poor, 1=average, 2=good). States match .default so payload
+        feasibility thresholds are unchanged; only per-client dwell differs."""
+        assert len(client_tiers) == num_clients
+        mbps = 1e6
+        states_bps = [50 * mbps, 10 * mbps, 2 * mbps]
+        per_client = [cls.TIER_TRANSITIONS[t] for t in client_tiers]
+        return cls(
+            num_clients, num_rounds, states_bps, cls.TIER_TRANSITIONS[1],
+            seed=seed, per_client_transition=per_client,
+            client_tiers=list(client_tiers),
+        )
+
+
+def assign_connectivity_tiers(client_class_counts, fractions=(0.3, 0.4, 0.3),
+                              corr=0.0, seed=0):
+    """Assign a connectivity tier (0=poor, 1=average, 2=good) to each client,
+    optionally correlated with WHAT DATA the client holds.
+
+    corr = 0.0: tiers are a seeded random assignment (independent of data).
+    corr = 1.0: clients are ranked by the center of mass of their label
+        distribution — clients concentrating low-index classes become the
+        poorly connected ones (digital-divide stress test, DIRECTION §5:
+        methods without unbiased correction develop per-class accuracy holes).
+    0 < corr < 1 interpolates (rank blend).
+
+    client_class_counts: dict[client_idx] -> per-class sample counts (array).
+    Returns list[int] of tiers, index = client_idx.
+    """
+    n = len(client_class_counts)
+    counts = [np.asarray(client_class_counts[c], dtype=float) for c in range(n)]
+    com = np.array([
+        (cnt * np.arange(len(cnt))).sum() / max(cnt.sum(), 1.0) for cnt in counts
+    ])
+    rng = np.random.default_rng([seed, 7919])  # distinct stream from the chains
+    rank_data = np.argsort(np.argsort(com))          # low class center -> low rank
+    rank_rand = np.argsort(rng.permutation(n))
+    score = corr * rank_data + (1.0 - corr) * rank_rand
+    order = np.argsort(score)  # first = lowest score -> poor tier
+
+    n_poor = int(round(fractions[0] * n))
+    n_avg = int(round(fractions[1] * n))
+    tiers = [None] * n
+    for pos, c in enumerate(order):
+        tiers[c] = 0 if pos < n_poor else (1 if pos < n_poor + n_avg else 2)
+    return tiers
 
 
 class TraceReplayBandwidth(BandwidthModel):

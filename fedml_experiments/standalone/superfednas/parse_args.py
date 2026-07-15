@@ -619,6 +619,31 @@ def add_args(parser):
         "blocks in coverage-debt order). Carriers are picked by lagged "
         "bandwidth (round r-1, no oracle).",
     )
+    parser.add_argument(
+        "--bw_profile",
+        type=str,
+        default="uniform",
+        choices=["uniform", "tiered"],
+        help="Connectivity heterogeneity (E4). uniform: every client has the "
+        "same Markov dynamics (legacy — no client is persistently "
+        "disadvantaged). tiered: persistent per-client profiles "
+        "(poor/average/good dwell dynamics over the same states).",
+    )
+    parser.add_argument(
+        "--bw_data_corr",
+        type=float,
+        default=0.0,
+        help="tiered profile only: correlation strength in [0,1] between a "
+        "client's connectivity tier and its label distribution. 0 = random "
+        "assignment; 1 = clients concentrating low-index classes get the "
+        "poor tier (digital-divide stress test, DIRECTION §5).",
+    )
+    parser.add_argument(
+        "--log_per_class",
+        action="store_true",
+        help="Log per-class test accuracy of each tier probe at every eval "
+        "checkpoint (class x method heatmap data, E4).",
+    )
 
     return parser
 
