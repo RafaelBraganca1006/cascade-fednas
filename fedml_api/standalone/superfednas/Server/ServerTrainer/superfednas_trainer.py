@@ -330,18 +330,20 @@ class FLOFA_Trainer(ABC):
         device = self.client_trainer.device
         for subnet_arch in self.args.ckpt_subnets:
             tier = self._tier_name(subnet_arch) or str(subnet_arch)
-            model = self.server_model.get_subnet(**subnet_arch)
+            # get_subnet() returns a ClientModel wrapper, not the nn.Module —
+            # unwrap it (mirrors client_trainer.local_test's get_model() use).
+            wrapped = self.server_model.get_subnet(**subnet_arch)
+            model = wrapped.get_model()
             model.to(device)
             model.eval()
             correct, total = None, None
             with torch.no_grad():
                 for x, y in self.test_global:
                     x, y = x.to(device), y.view(-1).to(device)
-                    pred = model(x).argmax(dim=1)
+                    logits = model(x)
+                    pred = logits.argmax(dim=1)
                     if correct is None:
-                        num_cls = int(
-                            max(model(x[:1]).shape[1], int(y.max()) + 1)
-                        )
+                        num_cls = int(max(logits.shape[1], int(y.max()) + 1))
                         correct = torch.zeros(num_cls, device=device)
                         total = torch.zeros(num_cls, device=device)
                     total += torch.bincount(y, minlength=len(total)).float()

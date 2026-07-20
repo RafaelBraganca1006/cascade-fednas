@@ -117,6 +117,10 @@ def main():
     ap.add_argument("--population_size", type=int, default=50)
     ap.add_argument("--mutation_ratio", type=float, default=0.5)
     ap.add_argument("--parent_ratio", type=float, default=0.25)
+    ap.add_argument("--mutate_prob", type=float, default=0.1,
+                     help="per-gene mutation probability inside nas_flop's "
+                     "mutate_sample (matches train.py's default); missing "
+                     "here crashed pareto mode with AttributeError.")
     # data plumbing (defaults match the training runs)
     ap.add_argument("--dataset", default="cifar10")
     ap.add_argument("--data_dir", default="./../../../data/cifar10")
