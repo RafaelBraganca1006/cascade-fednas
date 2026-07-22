@@ -269,6 +269,7 @@ def add_args(parser):
             "multi_sandwich",
             "TS_KD",
             "PS",
+            "policy_assign",
             "capacity_aware",
         ],
         help="Subnetwork selection strategy for every round",
@@ -618,6 +619,27 @@ def add_args(parser):
         "shard carriers (train the full supernet, upload assigned supernet "
         "blocks in coverage-debt order). Carriers are picked by lagged "
         "bandwidth (round r-1, no oracle).",
+    )
+    parser.add_argument(
+        "--assignment_policy",
+        type=str,
+        default="none",
+        choices=["none", "greedy", "lyapunov", "bandit"],
+        help="Only used when --subnet_dist_type policy_assign (DIRECTION §3.2, "
+        "retargeted 2026-07-22): which AssignmentPolicy decides each client's "
+        "tier under nested transmission. 'greedy' is the lambda=0 optimum "
+        "(Lemma 1, no E3 dependency, functional today); 'lyapunov'/'bandit' "
+        "need --policy_lambda from the E3 ablation and are structural stubs "
+        "until their reward/context wiring lands (see comm_sim/policies/).",
+    )
+    parser.add_argument(
+        "--policy_lambda",
+        type=float,
+        default=None,
+        help="Cross-context penalty rate for the lyapunov/bandit assignment "
+        "policies (DIRECTION §3.2) -- set from the E3 gradient-context "
+        "ablation result. Required (no default) for lyapunov/bandit; unused "
+        "by greedy.",
     )
     parser.add_argument(
         "--nested_context_ablation",

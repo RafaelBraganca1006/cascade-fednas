@@ -50,6 +50,7 @@ class BaseServerModel(ABC):
         self.subnet_sampling["TS_KD"] = self.tracking_sandwich_kd
         self.subnet_sampling["PS"] = self.ps
         self.subnet_sampling["capacity_aware"] = self.capacity_aware_sample
+        self.subnet_sampling["policy_assign"] = self.policy_assign_sample
 
         # dynFedNAS capacity-aware sampling state (Phase 3). cap_bw is None when
         # comm_sim is off, in which case capacity_aware degenerates to the
@@ -61,6 +62,14 @@ class BaseServerModel(ABC):
         self.cap_max_infeasible = 0
         self._cap_tier_bits = None
         self._cap_max_bits = None
+
+        # assignment-policy sampling state ("policy_assign", DIRECTION §3.2,
+        # retargeted 2026-07-22: "who trains what" under nested transmission).
+        # Reuses cap_bw/cap_deadline above for bandwidth context (set via the
+        # same set_capacity_info() the capacity_aware sampler uses) -- only
+        # _policy and the id-carrying tier menu are new.
+        self._policy = None
+        self._policy_tier_options = None
 
     def set_top_bottom_k(self, top_k, bottom_k):
         self.top_k = top_k
@@ -444,6 +453,67 @@ class BaseServerModel(ABC):
         elif self.is_min_net(arch_config):
             self.cli_subnet_track[client_idx]["smallest"] += 1
         return client_model
+
+    def set_assignment_policy(self, policy):
+        """Register the AssignmentPolicy object for the "policy_assign"
+        sampler (DIRECTION §3.2). Call once at trainer init -- the policy
+        instance persists across rounds (stateful policies like Lyapunov/
+        the bandit carry their own queues/weights internally)."""
+        self._policy = policy
+
+    def _ensure_policy_tier_options(self, args):
+        if self._policy_tier_options is not None:
+            return self._policy_tier_options
+        from fedml_api.standalone.superfednas.comm_sim.policies import TierOption
+
+        options = []
+        for tier_id, config in args["diverse_subnets"].items():
+            bits = self._payload_bits(self.get_subnet(**config))
+            options.append(TierOption(tier_id=tier_id, config=config, payload_bits=bits))
+        options.sort(key=lambda t: t.payload_bits)
+        self._policy_tier_options = options
+        return options
+
+    def policy_assign_sample(self, round_num, client_idx, idx, args):
+        """--subnet_dist_type policy_assign: delegates tier choice to the
+        registered AssignmentPolicy (greedy/lyapunov/bandit, DIRECTION §3.2)
+        for "middle" clients, same min/max guaranteed-coverage slots as
+        every other TS-style sampler (keeps architecture-space coverage
+        intact regardless of which policy is active)."""
+        from fedml_api.standalone.superfednas.comm_sim.policies import AssignmentContext
+
+        np.random.seed(round_num + client_idx)
+        if self.cli_subnet_track[client_idx] is None:
+            self.cli_subnet_track[client_idx] = dict()
+        if client_idx in self.smallest_subnet_min_idx:
+            arch_config = self.min_subnet_arch()
+            self.cli_subnet_track[client_idx]["smallest"] += 1
+            return self.get_subnet(**arch_config)
+        if client_idx in self.largest_subnet_min_idx:
+            arch_config = self.max_subnet_arch()
+            self.cli_subnet_track[client_idx]["largest"] += 1
+            return self.get_subnet(**arch_config)
+        if self._policy is None:
+            raise RuntimeError(
+                "policy_assign sampler active but no policy registered -- "
+                "call set_assignment_policy() before update_sample()."
+            )
+        tier_options = self._ensure_policy_tier_options(args)
+        bw_estimate = self.cap_bw.get(client_idx) if self.cap_bw is not None else None
+        ctx = AssignmentContext(
+            round_num=round_num,
+            client_idx=client_idx,
+            tier_options=tier_options,
+            bw_estimate_bps=bw_estimate,
+            upload_window_s=self.cap_deadline,
+        )
+        chosen = self._policy.assign(ctx)
+        arch_config = chosen.config
+        if self.is_max_net(arch_config):
+            self.cli_subnet_track[client_idx]["largest"] += 1
+        elif self.is_min_net(arch_config):
+            self.cli_subnet_track[client_idx]["smallest"] += 1
+        return self.get_subnet(**arch_config)
 
     def crossover_sample(self, par1, par2):
         new_sample = copy.deepcopy(par1)

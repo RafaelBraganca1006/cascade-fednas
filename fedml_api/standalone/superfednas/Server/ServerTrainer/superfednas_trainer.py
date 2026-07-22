@@ -143,6 +143,28 @@ class FLOFA_Trainer(ABC):
             self._unit_bits = None
             self._unit_last_round = None
 
+        # ---- assignment policy ("policy_assign" sampler, DIRECTION §3.2,
+        # retargeted 2026-07-22: "who trains what" under nested transmission) ----
+        if self.args.subnet_dist_type == "policy_assign":
+            from fedml_api.standalone.superfednas.comm_sim.policies import POLICIES
+
+            policy_name = getattr(self.args, "assignment_policy", "none")
+            if policy_name not in POLICIES:
+                raise ValueError(
+                    "--subnet_dist_type policy_assign requires --assignment_policy "
+                    "in %s, got %r" % (list(POLICIES), policy_name)
+                )
+            lam = getattr(self.args, "policy_lambda", None)
+            if policy_name == "greedy":
+                policy_obj = POLICIES[policy_name]()  # no lambda dependency (Lemma 1)
+            else:
+                policy_obj = POLICIES[policy_name](lam=lam)  # E3-gated, see policies/
+            self.server_model.set_assignment_policy(policy_obj)
+            logging.info(
+                "[policy] assignment_policy=%s active (lambda=%s)"
+                % (policy_name, lam)
+            )
+
         self.wt_avg_sched_method = wt_avg_sched_method
         self.weighted_avg_scheduler = dict()
         self.weighted_avg_scheduler["Uniform"] = self.uniform_avg
@@ -494,7 +516,10 @@ class FLOFA_Trainer(ABC):
         # maxnet aggregation weight tied to it) only lands on eligible clients.
         # "oracle" assigns with this round's true bandwidth; "lagged" assigns
         # with the previous round's (realistic: the estimate can be stale).
-        if self.comm_sim is not None and self.args.subnet_dist_type == "capacity_aware":
+        if self.comm_sim is not None and self.args.subnet_dist_type in (
+            "capacity_aware",
+            "policy_assign",
+        ):
             bw_round = round_num
             if getattr(self.args, "bw_estimate", "oracle") == "lagged":
                 bw_round = max(round_num - 1, 0)
