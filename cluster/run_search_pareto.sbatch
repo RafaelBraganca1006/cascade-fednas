@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=search_pareto_%j.out
@@ -10,7 +10,12 @@
 #   sbatch cluster/run_search_pareto.sbatch <CKPT_PATH> <TAG> [--full]
 #
 #   Default: short budget (max_time_budget=5, population_size=15) — ~30 min, for testing.
-#   --full:  production budget (max_time_budget=20, population_size=50) — ~3-4 h.
+#   --full:  T=25, pop=50 — ~1.5-2h (fixed 2026-07-22: this used to say T=20/pop=50
+#            in this comment but the code below actually ran T=500/pop=100 --
+#            stale-doc/code mismatch. That's why job 103152 (arm a) only got
+#            77/500 gens into the FIRST of 5 constraints in 12h before timing
+#            out. New numbers are calibrated from that run's observed rate
+#            (~90s/gen at pop=100 on this checkpoint) with margin.
 #
 # Output: search_<TAG>_pareto.csv (in the repo root)
 
@@ -32,9 +37,9 @@ OUTDIR="$SLURM_SUBMIT_DIR"
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
 
 if [ "$MODE" = "--full" ]; then
-  TIME_BUDGET=500
-  POP_SIZE=100
-  echo "=== pareto search | tag=$TAG | FULL budget (T=500, pop=100, SuperFedNAS-equivalent) ==="
+  TIME_BUDGET=25
+  POP_SIZE=50
+  echo "=== pareto search | tag=$TAG | FULL budget (T=25, pop=50) ==="
 else
   TIME_BUDGET=5
   POP_SIZE=15
