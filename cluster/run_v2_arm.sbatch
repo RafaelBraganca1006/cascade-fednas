@@ -8,17 +8,22 @@
 # Stage 4): vanilla TS sampling under a chosen deadline and transmission mode.
 #
 # Usage (from the dynfednas_v2 repo root):
-#   sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE]
+#   sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE] [ABLATION]
 #
 #   sbatch cluster/run_v2_arm.sbatch 20 nested_shard 20    # shard smoke
 #   sbatch cluster/run_v2_arm.sbatch 20 all_or_nothing 150 # three-arm harsh (a)
 #   sbatch cluster/run_v2_arm.sbatch 20 nested 150         # three-arm harsh (b)
 #   sbatch cluster/run_v2_arm.sbatch 20 nested_shard 150   # three-arm harsh (c)
 #   sbatch cluster/run_v2_arm.sbatch 20 all_or_nothing 150 static  # E2b: alt sampler
+#   sbatch cluster/run_v2_arm.sbatch 20 nested 150 TS_all_random ablation  # E3
 #
 # Same model/subnets/schedule/seeds as run_sweep / run_phase3 -> directly
 # comparable across arms and with the v1 characterization runs (when
-# SUBNET_DIST_TYPE is left at its default, TS_all_random).
+# SUBNET_DIST_TYPE is left at its default, TS_all_random). The E3 ablation run
+# above is DIRECTLY comparable to the existing arm (b) baseline
+# (results/v2_arms/v2_arm_harsh_nested.out, same deadline/tx_mode/rounds/seeds)
+# without needing to rerun the baseline -- nothing in the aggregation/
+# truncation path changed since that run.
 
 . /etc/profile.d/modules.sh
 module add cuda/12.9
@@ -29,11 +34,17 @@ DEADLINE="$1"
 TX_MODE="$2"
 ROUNDS="${3:-150}"
 SUBNET_DIST="${4:-TS_all_random}"
-if [ -z "$DEADLINE" ] || [ -z "$TX_MODE" ]; then
-  echo "usage: sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE]"; exit 1
+ABLATION_FLAG=""
+RUN_SUFFIX=""
+if [ "$5" = "ablation" ]; then
+  ABLATION_FLAG="--nested_context_ablation"
+  RUN_SUFFIX="_ctxablation"
 fi
-RUN_NAME="v2_${TX_MODE}_d${DEADLINE}_r${ROUNDS}_${SUBNET_DIST}"
-echo "=== dynFedNAS v2 arm | deadline=${DEADLINE}s tx_mode=${TX_MODE} rounds=${ROUNDS} subnet_dist=${SUBNET_DIST} ==="
+if [ -z "$DEADLINE" ] || [ -z "$TX_MODE" ]; then
+  echo "usage: sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE] [ABLATION]"; exit 1
+fi
+RUN_NAME="v2_${TX_MODE}_d${DEADLINE}_r${ROUNDS}_${SUBNET_DIST}${RUN_SUFFIX}"
+echo "=== dynFedNAS v2 arm | deadline=${DEADLINE}s tx_mode=${TX_MODE} rounds=${ROUNDS} subnet_dist=${SUBNET_DIST} ablation=${ABLATION_FLAG:-off} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
 python train.py \
@@ -47,7 +58,7 @@ python train.py \
   --frequency_of_the_test 25 --partition_alpha 100 --init_seed 0 \
   --efficient_test --verbose \
   --comm_sim --bw_deadline "$DEADLINE" --bw_seed 0 --tx_mode "$TX_MODE" \
-  --shard_carriers 2 \
+  --shard_carriers 2 $ABLATION_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
 
 OUT="$SLURM_SUBMIT_DIR/v2_arm_$SLURM_JOB_ID.out"

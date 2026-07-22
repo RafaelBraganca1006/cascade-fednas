@@ -643,6 +643,22 @@ class FLOFA_Trainer(ABC):
                         )
                         if tx_report.delivers_nothing():
                             continue  # not even the smallest clipped tier fits
+                        if (
+                            getattr(self.args, "nested_context_ablation", False)
+                            and not tx_report.completed_plan
+                        ):
+                            # E3 ablation (DIRECTION §3.1a): discard cross-context
+                            # deliveries (client trained alpha, truncated to a
+                            # smaller beta) instead of aggregating the sliced
+                            # beta-update. Isolates whether small tiers are
+                            # "poisoned" by being aggregated partly from
+                            # larger-context gradients -- compare this run's
+                            # per-tier accuracy against a matched flag=False run
+                            # (e.g. the existing arm-b nested baseline) with the
+                            # same bandwidth seed. Skipped BEFORE training (the
+                            # decision only needs config sizes, not weights), so
+                            # this also saves compute on discarded clients.
+                            continue
 
             client_model.set_avg_wt(avg_weights[idx])
             cur_model_vec = None

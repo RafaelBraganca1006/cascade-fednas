@@ -620,6 +620,17 @@ def add_args(parser):
         "bandwidth (round r-1, no oracle).",
     )
     parser.add_argument(
+        "--nested_context_ablation",
+        action="store_true",
+        help="E3 gradient-context ablation (DIRECTION §3.1a). nested/nested_shard "
+        "only: discard cross-context deliveries (client trained a larger config "
+        "alpha, deadline truncated to a smaller beta) instead of aggregating the "
+        "sliced beta-update. Compare per-tier accuracy against a matched run with "
+        "this flag off (same bandwidth seed) to test whether small tiers are "
+        "poisoned by larger-context gradients. Off by default (normal nested "
+        "behavior unaffected).",
+    )
+    parser.add_argument(
         "--bw_profile",
         type=str,
         default="uniform",
