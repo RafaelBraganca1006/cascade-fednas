@@ -500,12 +500,21 @@ class BaseServerModel(ABC):
             )
         tier_options = self._ensure_policy_tier_options(args)
         bw_estimate = self.cap_bw.get(client_idx) if self.cap_bw is not None else None
+        tier_debt = args.get("tier_debt")
+        debt_by_tier = (
+            {tid: round_num - last for tid, last in tier_debt.items()}
+            if tier_debt is not None
+            else None
+        )
+        data_utility = args.get("data_utility", {}).get(client_idx)
         ctx = AssignmentContext(
             round_num=round_num,
             client_idx=client_idx,
             tier_options=tier_options,
             bw_estimate_bps=bw_estimate,
             upload_window_s=self.cap_deadline,
+            debt_by_tier=debt_by_tier,
+            data_utility=data_utility,
         )
         chosen = self._policy.assign(ctx)
         arch_config = chosen.config

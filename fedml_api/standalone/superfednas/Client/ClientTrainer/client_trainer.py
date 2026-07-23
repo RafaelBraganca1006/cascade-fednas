@@ -16,6 +16,7 @@ class ClientTrainer(ABC):
         self.local_sample_number = None
         self.seed = 0
         self.teacher_model = teacher_model
+        self.last_train_loss = None
 
     def cross_entropy_loss_with_soft_target(self, pred, soft_target):
         logsoftmax = nn.LogSoftmax(dim=1)
@@ -23,6 +24,12 @@ class ClientTrainer(ABC):
 
     def get_sample_number(self):
         return self.local_sample_number
+
+    def get_last_train_loss(self):
+        """The cheap (config, loss) data-utility signal (DIRECTION §3.2):
+        every client's local training loss, always available regardless of
+        bandwidth -- feeds the assignment policy's data_utility context."""
+        return self.last_train_loss
 
     def update_local_dataset(
         self, client_idx, local_training_data, local_test_data, local_sample_number,

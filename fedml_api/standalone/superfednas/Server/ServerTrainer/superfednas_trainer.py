@@ -164,6 +164,26 @@ class FLOFA_Trainer(ABC):
                 "[policy] assignment_policy=%s active (lambda=%s)"
                 % (policy_name, lam)
             )
+            # Tier-level debt table (DIRECTION §3.2/§3.3): the Lyapunov virtual
+            # queues Q_u(t), at TIER granularity (unlike the shard path's
+            # per-BLOCK `_unit_last_round`). -1 = never served, so initial
+            # staleness (round_num - last_round) is large for every tier.
+            # Live reference stashed in sampler_args -- policy_assign_sample
+            # reads it fresh every round without needing per-round rewiring.
+            self._tier_last_round = {
+                tier_id: -1 for tier_id in self.args.diverse_subnets
+            }
+            self._config_to_tier_id = {
+                str(cfg): tier_id
+                for tier_id, cfg in self.args.diverse_subnets.items()
+            }
+            self.sampler_args["tier_debt"] = self._tier_last_round
+            # Cheap (config, loss) data-utility report (DIRECTION §3.2 /
+            # FEEDBACK_REVIEW.md): every client's last local training loss,
+            # always available regardless of bandwidth. {client_idx: {config,
+            # loss}}. Live reference, same pattern as tier_debt above.
+            self._data_utility = {}
+            self.sampler_args["data_utility"] = self._data_utility
 
         self.wt_avg_sched_method = wt_avg_sched_method
         self.weighted_avg_scheduler = dict()
@@ -291,6 +311,24 @@ class FLOFA_Trainer(ABC):
         beta_model = self._scratch_server.get_subnet(**beta_config)
         beta_model.set_avg_wt(trained_model.avg_weight)
         return beta_model
+
+    def _tier_id_for_config(self, config):
+        """Map an architecture config back to its diverse_subnets key
+        ("0".."3"), for tier-level debt tracking (comm_sim.policies). None if
+        config doesn't match any configured tier (e.g. a non-tier arch)."""
+        return self._config_to_tier_id.get(str(config))
+
+    def _mark_tier_debt_served(self, round_num, plan, delivered_tier_idx):
+        """DIRECTION §3.2/§3.3: a delivery reaching plan.tiers[delivered_tier_idx]
+        refreshes THAT shell and every smaller one (nested shells are
+        cumulative -- S subset M subset L subset XL), regardless of whether
+        the delivery was native or cross-context (E3: cross-context is net
+        beneficial, still counts as "served"). No-op if the config doesn't
+        match a configured tier."""
+        for k in range(delivered_tier_idx + 1):
+            tier_id = self._tier_id_for_config(plan.tiers[k][1])
+            if tier_id is not None:
+                self._tier_last_round[tier_id] = round_num
 
     @staticmethod
     def _tier_name(subnet_info):
@@ -681,6 +719,13 @@ class FLOFA_Trainer(ABC):
                                 tx_report.bits_delivered / intended_bits, 1.0
                             )
                         if (
+                            self.args.subnet_dist_type == "policy_assign"
+                            and tx_report.delivered_tier is not None
+                        ):
+                            self._mark_tier_debt_served(
+                                round_num, plan, tx_report.delivered_tier
+                            )
+                        if (
                             getattr(self.args, "nested_context_ablation", False)
                             and not tx_report.completed_plan
                         ):
@@ -744,6 +789,15 @@ class FLOFA_Trainer(ABC):
             updated_cli_model = self.client_trainer.train(cur_lr, local_ep)
             sample_num = self.client_trainer.get_sample_number()
             training_samples.append(sample_num)
+            if self.args.subnet_dist_type == "policy_assign":
+                # cheap data-utility report (DIRECTION §3.2): always recorded,
+                # regardless of whether this client's delivery later succeeds
+                # or drops -- matches the "architecture-preference signal is
+                # cheap and always transmittable" precision fix (FEEDBACK_REVIEW.md).
+                self._data_utility[client_idx] = {
+                    "config": client_model.model_config,
+                    "loss": self.client_trainer.get_last_train_loss(),
+                }
             # Update client state
             if self.feddyn:
                 updated_cli_model_vec = model_dict_to_vector(

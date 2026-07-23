@@ -164,6 +164,7 @@ class SubnetTrainer(ClientTrainer):
                             m.running_var.equal(torch.ones_like(m.running_var)),
                             "BN running var param not all 1s",
                         )
+        self.last_train_loss = epoch_loss[-1] if epoch_loss else None
         return self.client_model
 
     def test(self, dataset, args, **kwargs):
