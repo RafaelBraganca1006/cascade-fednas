@@ -642,6 +642,17 @@ def add_args(parser):
         "by greedy.",
     )
     parser.add_argument(
+        "--maxnet_delivery_aware",
+        action="store_true",
+        help="DIRECTION §3.3 fix (2026-07-23): scale a client's MaxNet "
+        "aggregation weight by how much of its intended (trained) payload "
+        "actually arrived, instead of applying the full pre-round slot "
+        "weight (which can be up to beta=0.9 early in training) to a small "
+        "truncated slice. nested/nested_shard's shell-truncation path only "
+        "(same scope as --nested_context_ablation). Off by default -- "
+        "preserves comparability with all prior results.",
+    )
+    parser.add_argument(
         "--nested_context_ablation",
         action="store_true",
         help="E3 gradient-context ablation (DIRECTION §3.1a). nested/nested_shard "

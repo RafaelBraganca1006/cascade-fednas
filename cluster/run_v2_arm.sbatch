@@ -8,7 +8,7 @@
 # Stage 4): vanilla TS sampling under a chosen deadline and transmission mode.
 #
 # Usage (from the dynfednas_v2 repo root):
-#   sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE] [ABLATION] [ASSIGNMENT_POLICY]
+#   sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE] [ABLATION] [ASSIGNMENT_POLICY] [MAXNET_FIX]
 #
 #   sbatch cluster/run_v2_arm.sbatch 20 nested_shard 20    # shard smoke
 #   sbatch cluster/run_v2_arm.sbatch 20 all_or_nothing 150 # three-arm harsh (a)
@@ -17,16 +17,18 @@
 #   sbatch cluster/run_v2_arm.sbatch 20 all_or_nothing 150 static  # E2b: alt sampler
 #   sbatch cluster/run_v2_arm.sbatch 20 nested 150 TS_all_random ablation  # E3
 #   sbatch cluster/run_v2_arm.sbatch 20 nested 150 policy_assign none greedy  # E5 greedy
+#   sbatch cluster/run_v2_arm.sbatch 20 nested 150 TS_all_random none none maxnetfix  # §3.3 fix
 #
 # Same model/subnets/schedule/seeds as run_sweep / run_phase3 -> directly
 # comparable across arms and with the v1 characterization runs (when
-# SUBNET_DIST_TYPE is left at its default, TS_all_random). The E3 ablation run
-# above is DIRECTLY comparable to the existing arm (b) baseline
-# (results/v2_arms/v2_arm_harsh_nested.out, same deadline/tx_mode/rounds/seeds)
-# without needing to rerun the baseline -- nothing in the aggregation/
-# truncation path changed since that run. Same for the E5 greedy run above:
-# SUBNET_DIST_TYPE=policy_assign requires ASSIGNMENT_POLICY (5th arg is the
-# ablation slot, so pass "none" there to skip it and put the policy 6th).
+# SUBNET_DIST_TYPE is left at its default, TS_all_random). The E3 ablation and
+# §3.3 maxnetfix runs above are DIRECTLY comparable to the existing arm (b)
+# baseline (results/v2_arms/v2_arm_harsh_nested.out, same deadline/tx_mode/
+# rounds/seeds) without needing to rerun the baseline -- nothing in the
+# aggregation/truncation path changed since that run (maxnetfix is off by
+# default). SUBNET_DIST_TYPE=policy_assign requires ASSIGNMENT_POLICY (5th
+# arg is the ablation slot, pass "none" there to skip it and put the policy
+# 6th; 7th arg is the maxnetfix slot, pass "none"/"maxnetfix").
 
 . /etc/profile.d/modules.sh
 module add cuda/12.9
@@ -44,18 +46,23 @@ if [ "$5" = "ablation" ]; then
   RUN_SUFFIX="_ctxablation"
 fi
 POLICY_FLAG=""
-if [ -n "$6" ]; then
+if [ -n "$6" ] && [ "$6" != "none" ]; then
   if [ "$SUBNET_DIST" != "policy_assign" ]; then
     echo "ASSIGNMENT_POLICY given but SUBNET_DIST_TYPE is not policy_assign"; exit 1
   fi
   POLICY_FLAG="--assignment_policy $6"
   RUN_SUFFIX="${RUN_SUFFIX}_policy${6}"
 fi
+MAXNETFIX_FLAG=""
+if [ "$7" = "maxnetfix" ]; then
+  MAXNETFIX_FLAG="--maxnet_delivery_aware"
+  RUN_SUFFIX="${RUN_SUFFIX}_maxnetfix"
+fi
 if [ -z "$DEADLINE" ] || [ -z "$TX_MODE" ]; then
-  echo "usage: sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE] [ABLATION] [ASSIGNMENT_POLICY]"; exit 1
+  echo "usage: sbatch cluster/run_v2_arm.sbatch <DEADLINE_S> <TX_MODE> [ROUNDS] [SUBNET_DIST_TYPE] [ABLATION] [ASSIGNMENT_POLICY] [MAXNET_FIX]"; exit 1
 fi
 RUN_NAME="v2_${TX_MODE}_d${DEADLINE}_r${ROUNDS}_${SUBNET_DIST}${RUN_SUFFIX}"
-echo "=== dynFedNAS v2 arm | deadline=${DEADLINE}s tx_mode=${TX_MODE} rounds=${ROUNDS} subnet_dist=${SUBNET_DIST} ablation=${ABLATION_FLAG:-off} policy=${6:-off} ==="
+echo "=== dynFedNAS v2 arm | deadline=${DEADLINE}s tx_mode=${TX_MODE} rounds=${ROUNDS} subnet_dist=${SUBNET_DIST} ablation=${ABLATION_FLAG:-off} policy=${6:-off} maxnetfix=${MAXNETFIX_FLAG:-off} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
 python train.py \
@@ -69,7 +76,7 @@ python train.py \
   --frequency_of_the_test 25 --partition_alpha 100 --init_seed 0 \
   --efficient_test --verbose \
   --comm_sim --bw_deadline "$DEADLINE" --bw_seed 0 --tx_mode "$TX_MODE" \
-  --shard_carriers 2 $ABLATION_FLAG $POLICY_FLAG \
+  --shard_carriers 2 $ABLATION_FLAG $POLICY_FLAG $MAXNETFIX_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
 
 OUT="$SLURM_SUBMIT_DIR/v2_arm_$SLURM_JOB_ID.out"

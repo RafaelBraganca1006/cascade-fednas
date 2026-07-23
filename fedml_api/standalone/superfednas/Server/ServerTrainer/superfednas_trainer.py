@@ -550,6 +550,13 @@ class FLOFA_Trainer(ABC):
         for idx in range(self.args.client_num_per_round):
             # update dataset
             client_idx = client_indexes[idx]
+            # DIRECTION §3.3 (delivery-aware aggregation weight, 2026-07-23):
+            # fraction of this client's intended payload that actually arrived.
+            # 1.0 unless overwritten below (nested truncation) -- explicitly
+            # reset every iteration so a value from carrier/all_or_nothing
+            # branches on a DIFFERENT client this same round never leaks in
+            # (several branches below reuse local variable names like `plan`).
+            delivery_completeness = 1.0
 
             self.client_trainer.update_local_dataset(
                 client_idx,
@@ -668,6 +675,11 @@ class FLOFA_Trainer(ABC):
                         )
                         if tx_report.delivers_nothing():
                             continue  # not even the smallest clipped tier fits
+                        intended_bits = plan.total_bits()
+                        if intended_bits > 0:
+                            delivery_completeness = min(
+                                tx_report.bits_delivered / intended_bits, 1.0
+                            )
                         if (
                             getattr(self.args, "nested_context_ablation", False)
                             and not tx_report.completed_plan
@@ -685,7 +697,21 @@ class FLOFA_Trainer(ABC):
                             # this also saves compute on discarded clients.
                             continue
 
-            client_model.set_avg_wt(avg_weights[idx])
+            maxnet_weight = avg_weights[idx]
+            if (
+                getattr(self.args, "maxnet_delivery_aware", False)
+                and delivery_completeness < 1.0
+            ):
+                # DIRECTION §3.3: a client's MaxNet weight was assigned to its
+                # PRE-round slot, before we knew whether the deadline would
+                # truncate the delivery. Scale it down by how much of the
+                # intended payload actually arrived, instead of applying the
+                # full (possibly slot-max, beta up to 0.9 early in training)
+                # weight to a small truncated slice. Off by default --
+                # comparable to all prior results (v2_arm_harsh_nested.out
+                # etc. all ran without this).
+                maxnet_weight *= delivery_completeness
+            client_model.set_avg_wt(maxnet_weight)
             cur_model_vec = None
             self.client_trainer.set_model(client_model)
             self.client_trainer.set_alpha(self.weighted_feddyn_alpha[client_idx])
