@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=e4_pilot_%j.out
 #
-# dynFedNAS — E4 pilot: non-IID (Dirichlet) + heterogeneous connectivity
-# (tiered profiles) + optional bandwidth-data correlation (EXPERIMENTS.md E4).
+# dynFedNAS — E4: non-IID (Dirichlet) + heterogeneous connectivity (tiered
+# profiles) + optional bandwidth-data correlation (EXPERIMENTS.md E4).
 #
 # Usage (from the dynfednas_v2 repo root):
-#   sbatch cluster/run_e4_pilot.sbatch <DEADLINE_S> <TX_MODE> <ALPHA> <CORR> [ROUNDS] [SUBNET_DIST_TYPE] [ASSIGNMENT_POLICY] [MAXNET_FIX]
+#   sbatch cluster/run_e4_pilot.sbatch <DEADLINE_S> <TX_MODE> <ALPHA> <CORR> [ROUNDS] [SUBNET_DIST_TYPE] [ASSIGNMENT_POLICY] [MAXNET_FIX] [POLICY_LAMBDA]
 #
 #   sbatch cluster/run_e4_pilot.sbatch 20 all_or_nothing 0.5 0.0 75   # non-IID alone
 #   sbatch cluster/run_e4_pilot.sbatch 20 nested         0.5 0.0 75
@@ -16,6 +16,9 @@
 #   sbatch cluster/run_e4_pilot.sbatch 20 nested 0.5 1.0 75 policy_assign greedy maxnetfix
 #     # does greedy protect the corr=1.0 blind-spot classes any better than
 #     # blind TS_all_random? (it's bandwidth-blind too -- expect: probably not)
+#   sbatch cluster/run_e4_pilot.sbatch 20 nested 0.5 0.0 150 policy_assign bandit maxnetfix 0.1
+#     # 150-round non-IID (corr=0) run, not a 75-round pilot -- POLICY_LAMBDA
+#     # (8th arg) required for lyapunov/bandit, same as run_v2_arm.sbatch
 #
 # Differences vs run_v2_arm.sbatch (kept identical otherwise, for attribution):
 #   --partition_alpha ALPHA   (v2 arms used 100 = near-IID)
@@ -23,9 +26,13 @@
 #   --bw_data_corr CORR       0 = independent, 1 = poor clients hold low classes
 #   --log_per_class           per-class acc at eval checkpoints (heatmap data)
 #
-# Pilots (EXPERIMENTS.md two-phase strategy): 75 rounds, single seed —
-# design decisions only, numbers never enter the thesis text. corr=1.0 is a
-# worst-case sensitivity bound, not a real-world prevalence claim (DIRECTION §5).
+# ROUNDS defaults to 75 (EXPERIMENTS.md two-phase pilot strategy: single seed,
+# design decisions only, numbers never enter the thesis text as-is) but the
+# script itself doesn't enforce that -- pass 150 for a full run comparable to
+# the v2_arms/ 150-round runs (same seeds/deadline/subnets), just under
+# non-IID instead of near-IID. --time bumped to 12h (from 6h) to cover that
+# case; 75-round pilots finish well within it too. corr=1.0 is a worst-case
+# sensitivity bound, not a real-world prevalence claim (DIRECTION §5).
 
 . /etc/profile.d/modules.sh
 module add cuda/12.9
@@ -52,11 +59,16 @@ if [ "$8" = "maxnetfix" ]; then
   MAXNETFIX_FLAG="--maxnet_delivery_aware"
   RUN_SUFFIX="${RUN_SUFFIX}_maxnetfix"
 fi
+LAMBDA_FLAG=""
+if [ -n "$9" ]; then
+  LAMBDA_FLAG="--policy_lambda $9"
+  RUN_SUFFIX="${RUN_SUFFIX}_lam${9}"
+fi
 if [ -z "$DEADLINE" ] || [ -z "$TX_MODE" ] || [ -z "$ALPHA" ] || [ -z "$CORR" ]; then
-  echo "usage: sbatch cluster/run_e4_pilot.sbatch <DEADLINE_S> <TX_MODE> <ALPHA> <CORR> [ROUNDS] [SUBNET_DIST_TYPE] [ASSIGNMENT_POLICY] [MAXNET_FIX]"; exit 1
+  echo "usage: sbatch cluster/run_e4_pilot.sbatch <DEADLINE_S> <TX_MODE> <ALPHA> <CORR> [ROUNDS] [SUBNET_DIST_TYPE] [ASSIGNMENT_POLICY] [MAXNET_FIX] [POLICY_LAMBDA]"; exit 1
 fi
 RUN_NAME="e4_${TX_MODE}_d${DEADLINE}_a${ALPHA}_c${CORR}_r${ROUNDS}_${SUBNET_DIST}${RUN_SUFFIX}"
-echo "=== dynFedNAS E4 pilot | deadline=${DEADLINE}s tx=${TX_MODE} alpha=${ALPHA} corr=${CORR} rounds=${ROUNDS} subnet_dist=${SUBNET_DIST} policy=${7:-off} maxnetfix=${MAXNETFIX_FLAG:-off} ==="
+echo "=== dynFedNAS E4 pilot | deadline=${DEADLINE}s tx=${TX_MODE} alpha=${ALPHA} corr=${CORR} rounds=${ROUNDS} subnet_dist=${SUBNET_DIST} policy=${7:-off} maxnetfix=${MAXNETFIX_FLAG:-off} lambda=${9:-none} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
 python train.py \
@@ -71,7 +83,7 @@ python train.py \
   --efficient_test --verbose --log_per_class \
   --comm_sim --bw_deadline "$DEADLINE" --bw_seed 0 --tx_mode "$TX_MODE" \
   --bw_profile tiered --bw_data_corr "$CORR" \
-  --shard_carriers 2 $POLICY_FLAG $MAXNETFIX_FLAG \
+  --shard_carriers 2 $POLICY_FLAG $MAXNETFIX_FLAG $LAMBDA_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
 
 OUT="$SLURM_SUBMIT_DIR/e4_pilot_$SLURM_JOB_ID.out"
