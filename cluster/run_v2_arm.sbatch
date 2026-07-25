@@ -31,7 +31,7 @@
 # comparable across arms and with the v1 characterization runs (when
 # SUBNET_DIST_TYPE is left at its default, TS_all_random). The E3 ablation and
 # §3.3 maxnetfix runs above are DIRECTLY comparable to the existing arm (b)
-# baseline (results/v2_arms/v2_arm_harsh_nested.out, same deadline/tx_mode/
+# baseline (results/v2_arms/v2_arm_b_nested_baseline.out, same deadline/tx_mode/
 # rounds/seeds) without needing to rerun the baseline -- nothing in the
 # aggregation/truncation path changed since that run (maxnetfix is off by
 # default). SUBNET_DIST_TYPE=policy_assign requires ASSIGNMENT_POLICY (5th

@@ -832,7 +832,7 @@ class FLOFA_Trainer(ABC):
                 # intended payload actually arrived, instead of applying the
                 # full (possibly slot-max, beta up to 0.9 early in training)
                 # weight to a small truncated slice. Off by default --
-                # comparable to all prior results (v2_arm_harsh_nested.out
+                # comparable to all prior results (v2_arm_b_nested_baseline.out
                 # etc. all ran without this).
                 maxnet_weight *= delivery_completeness
             client_model.set_avg_wt(maxnet_weight)
