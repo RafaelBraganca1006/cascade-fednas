@@ -173,10 +173,6 @@ class FLOFA_Trainer(ABC):
             self._tier_last_round = {
                 tier_id: -1 for tier_id in self.args.diverse_subnets
             }
-            self._config_to_tier_id = {
-                str(cfg): tier_id
-                for tier_id, cfg in self.args.diverse_subnets.items()
-            }
             self.sampler_args["tier_debt"] = self._tier_last_round
             # Cheap (config, loss) data-utility report (DIRECTION §3.2 /
             # FEEDBACK_REVIEW.md): every client's last local training loss,
@@ -312,11 +308,32 @@ class FLOFA_Trainer(ABC):
         beta_model.set_avg_wt(trained_model.avg_weight)
         return beta_model
 
+    @staticmethod
+    def _normalize_arch(config):
+        """(d, e) as a comparable tuple, matching analysis/parse_runs.py's
+        tier_of() convention. Needed because a SAMPLED/delivered config
+        (from sample_subnet/get_subnet) is NOT the same structure as the
+        raw --diverse_subnets dict it originated from: it gains a 'w' key
+        and 'e' is expanded from a scalar into a per-block list -- naive
+        dict/str equality between the two NEVER matches (caught 2026-07-24:
+        the policy tally and tier-debt table were silently stuck at zero/
+        never-updating because of exactly this, before Lyapunov's first
+        real run -- see the [policy] round log this was built to catch)."""
+        d = tuple(config.get("d", []))
+        e = config.get("e")
+        if isinstance(e, (list, tuple)):
+            e = e[0] if len(set(e)) == 1 else None
+        return (d, e)
+
     def _tier_id_for_config(self, config):
         """Map an architecture config back to its diverse_subnets key
         ("0".."3"), for tier-level debt tracking (comm_sim.policies). None if
         config doesn't match any configured tier (e.g. a non-tier arch)."""
-        return self._config_to_tier_id.get(str(config))
+        target = self._normalize_arch(config)
+        for tier_id, cfg in self.args.diverse_subnets.items():
+            if self._normalize_arch(cfg) == target:
+                return tier_id
+        return None
 
     def _mark_tier_debt_served(self, round_num, plan, delivered_tier_idx):
         """DIRECTION §3.2/§3.3: a delivery reaching plan.tiers[delivered_tier_idx]
