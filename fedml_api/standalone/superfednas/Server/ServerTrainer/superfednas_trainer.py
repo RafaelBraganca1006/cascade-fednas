@@ -577,6 +577,15 @@ class FLOFA_Trainer(ABC):
         avg_gflops = 0
         avg_params = 0
         training_samples = []
+        policy_tier_counts = None
+        if self.args.subnet_dist_type == "policy_assign":
+            # [policy] round summary (added 2026-07-24, before Lyapunov's
+            # first real run): the only visibility into what the policy is
+            # actually deciding round to round. Without this, a degenerate
+            # policy (stuck always-max, or always-S) or a debt table that
+            # stops updating would be invisible until final accuracy, with
+            # no way to diagnose why.
+            policy_tier_counts = {tid: 0 for tid in self.args.diverse_subnets}
         if self.comm_sim is not None:
             self.comm_sim.start_round(round_num)
         # nested_shard: designate carriers that train the full supernet and
@@ -606,6 +615,10 @@ class FLOFA_Trainer(ABC):
             client_model = self.server_model.sample_subnet(
                 round_num, client_idx, idx, self.sampler_args
             )
+            if policy_tier_counts is not None:
+                tid = self._tier_id_for_config(client_model.model_config)
+                if tid is not None:
+                    policy_tier_counts[tid] += 1
             if self.args.dry_run:
                 flops, _ = fp.profile(client_model.model, (1, 3, 32, 32))
                 gflops = flops / 10e8
@@ -896,6 +909,24 @@ class FLOFA_Trainer(ABC):
                     comm_summary["comm/wall_clock_s"],
                     capacity_note,
                 )
+            )
+        if policy_tier_counts is not None:
+            mean_debt = {
+                tid: round_num - last
+                for tid, last in self._tier_last_round.items()
+            }
+            for tid, cnt in policy_tier_counts.items():
+                wandb.log(
+                    {f"policy/assigned_{tid}": cnt, "round": round_num},
+                    step=round_num,
+                )
+                wandb.log(
+                    {f"policy/debt_{tid}": mean_debt[tid], "round": round_num},
+                    step=round_num,
+                )
+            logging.info(
+                "[policy] round %d: assigned=%s debt=%s"
+                % (round_num, policy_tier_counts, mean_debt)
             )
         if self.args.dry_run:
             avg_gflops /= self.args.client_num_per_round
