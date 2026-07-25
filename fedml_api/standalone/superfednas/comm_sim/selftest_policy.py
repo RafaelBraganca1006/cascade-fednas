@@ -20,7 +20,9 @@ import sys
 # package, so its internal relative imports (`from .base import ...`)
 # resolve normally instead of fighting module identity across ad-hoc loads.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from policies import base, greedy as greedy_mod, lyapunov as lyap_mod  # noqa: E402
+from policies import (  # noqa: E402
+    base, greedy as greedy_mod, lyapunov as lyap_mod, bandit as bandit_mod,
+)
 import policies  # noqa: E402
 
 
@@ -100,15 +102,139 @@ def test_policies_gated_by_lambda():
     print("PASS lyapunov/bandit correctly refuse to run without lambda (E3-gated)")
 
 
-def test_bandit_is_still_a_structural_stub():
+def test_bandit_requires_debt_and_nonempty_tiers():
     bandit = policies.ContextualBanditPolicy(lam=0.1)
-    ctx = base.AssignmentContext(round_num=0, client_idx=0, tier_options=_fake_tiers())
     try:
-        bandit.assign(ctx)
-        raise AssertionError("bandit.assign should still raise NotImplementedError")
-    except NotImplementedError:
+        bandit.assign(base.AssignmentContext(
+            round_num=0, client_idx=0, tier_options=_fake_tiers(), debt_by_tier=None,
+        ))
+        raise AssertionError("expected ValueError on missing debt_by_tier")
+    except ValueError:
         pass
-    print("PASS bandit remains a structural stub (E6, not yet implemented)")
+    try:
+        bandit.assign(base.AssignmentContext(
+            round_num=0, client_idx=0, tier_options=[], debt_by_tier={},
+        ))
+        raise AssertionError("expected ValueError on empty tier_options")
+    except ValueError:
+        pass
+    print("PASS bandit raises on missing debt_by_tier / empty tier_options")
+
+
+def test_bandit_cold_start_ties_to_max_tier():
+    """All-zero weights -> every arm scores 0 -> tie-break must pick the
+    max tier, same convention as greedy/Lyapunov. eps0=0 disables
+    exploration so the test is deterministic."""
+    bandit = policies.ContextualBanditPolicy(lam=0.1, eps0=0.0, eps_min=0.0)
+    ctx = base.AssignmentContext(
+        round_num=0, client_idx=0, tier_options=_fake_tiers(),
+        debt_by_tier={"0": 5.0, "1": 5.0, "2": 5.0, "3": 5.0},
+    )
+    chosen = bandit.assign(ctx)
+    assert chosen.tier_id == "3", chosen
+    print("PASS bandit cold start (all-zero weights) ties to the max tier")
+
+
+def test_bandit_pending_lifecycle():
+    """assign() must stash exactly one pending entry per (round, client);
+    update() must consume (pop) it; a second update() for the same key
+    (or one that was never assigned, e.g. a forced min/max slot) must be
+    a silent no-op, not a crash -- this is both the reward-attribution
+    guard and the memory-leak guard from the DIRECTION risk pass."""
+    bandit = policies.ContextualBanditPolicy(lam=0.1, eps0=0.0, eps_min=0.0)
+    ctx = base.AssignmentContext(
+        round_num=7, client_idx=3, tier_options=_fake_tiers(),
+        debt_by_tier={"0": 1.0, "1": 1.0, "2": 1.0, "3": 1.0},
+    )
+    bandit.assign(ctx)
+    assert (7, 3) in bandit._pending, "assign() should stash a pending entry"
+
+    fb = base.DeliveryFeedback(
+        round_num=7, client_idx=3, assigned_tier="3", delivered_tier="1",
+        native_context=False, native_bits=0.0, cross_context_bits=20e6,
+    )
+    bandit.update(fb)
+    assert (7, 3) not in bandit._pending, "update() must pop the pending entry"
+
+    bandit.update(fb)  # second call, same key -- must not crash or double-update
+    unattributed_fb = base.DeliveryFeedback(
+        round_num=99, client_idx=5, assigned_tier="3", delivered_tier="3",
+        native_context=True, native_bits=40e6, cross_context_bits=0.0,
+    )
+    bandit.update(unattributed_fb)  # never assigned (e.g. forced slot) -- no-op
+    print("PASS bandit pending lifecycle: stashed on assign, consumed once on "
+          "update, unmatched updates no-op cleanly")
+
+
+def test_bandit_weights_move_toward_observed_reward():
+    """Basic LMS correctness: after one update with a large positive
+    reward for the chosen arm, the predicted score for that SAME context
+    must have moved closer to the reward (not away from it, not
+    unchanged)."""
+    bandit = policies.ContextualBanditPolicy(lam=0.1, lr=0.1, eps0=0.0, eps_min=0.0)
+    # Realistic debt (respects the system invariant debt <= round_num+1 --
+    # the earlier version of this test used debt=90 at round_num=0, which
+    # can never happen in the real trainer, and that unrealistic combination
+    # is exactly what exposed the overshoot bug plain LMS had).
+    tiers = sorted(_fake_tiers(), key=lambda t: t.payload_bits)
+    ctx = base.AssignmentContext(
+        round_num=100, client_idx=0, tier_options=tiers,
+        debt_by_tier={"0": 1.0, "1": 1.0, "2": 1.0, "3": 50.0},  # XL very stale
+    )
+    chosen = bandit.assign(ctx)
+    assert chosen.tier_id == "3", chosen  # cold start ties to max, per the test above
+    arm_idx = [t.tier_id for t in tiers].index(chosen.tier_id)
+    phi = bandit._features(ctx, tiers)
+    pred_before = bandit._dot(bandit._weights[arm_idx], phi)  # 0.0, all-zero init
+
+    max_payload = tiers[-1].payload_bits
+    native_bits = max_payload  # native delivery of the chosen (max) tier
+    fb = base.DeliveryFeedback(
+        round_num=100, client_idx=0, assigned_tier="3", delivered_tier="3",
+        native_context=True, native_bits=native_bits, cross_context_bits=0.0,
+    )
+    expected_reward = 50.0 * native_bits / max_payload  # = 50.0, matches bandit.py's formula
+    bandit.update(fb)  # the REAL update() -- not a hand-rolled reimplementation
+
+    pred_after = bandit._dot(bandit._weights[arm_idx], phi)
+    # Normalized LMS's exact, provable property: pred_after = (1-lr)*pred_before
+    # + lr*reward. Checking this equality (not just "moved closer") verifies
+    # the ACTUAL update() code path matches the documented math precisely.
+    expected_pred_after = (1 - bandit.lr) * pred_before + bandit.lr * expected_reward
+    assert abs(pred_after - expected_pred_after) < 1e-6, (
+        pred_before, pred_after, expected_pred_after,
+    )
+    assert abs(expected_reward - pred_after) < abs(expected_reward - pred_before)
+    print("PASS bandit's real update() moves the predicted score toward the "
+          "observed reward exactly as the normalized-LMS math predicts")
+
+
+def test_bandit_epsilon_decays():
+    bandit = policies.ContextualBanditPolicy(lam=0.1, eps0=0.3, eps_decay=0.98, eps_min=0.05)
+    e0 = bandit._epsilon(0)
+    e_mid = bandit._epsilon(50)
+    e_late = bandit._epsilon(10_000)
+    assert e0 == 0.3, e0
+    assert e_mid < e0, (e0, e_mid)
+    assert e_late == 0.05, e_late  # floors at eps_min
+    print(f"PASS bandit epsilon decays: {e0:.3f} -> {e_mid:.3f} -> {e_late:.3f} (floor)")
+
+
+def test_bandit_missing_bw_and_loss_default_gracefully():
+    bandit = policies.ContextualBanditPolicy(lam=0.1)
+    tiers = sorted(_fake_tiers(), key=lambda t: t.payload_bits)
+    ctx = base.AssignmentContext(
+        round_num=0, client_idx=0, tier_options=tiers,
+        debt_by_tier={"0": 1.0, "1": 1.0, "2": 1.0, "3": 1.0},
+        bw_estimate_bps=None, data_utility=None,
+    )
+    phi = bandit._features(ctx, tiers)
+    # layout: [debt x len(tiers), bw_feat, has_bw, loss_feat, has_loss, bias]
+    assert phi[len(tiers)] == 0.0, "bw_feat should be 0.0 when bandwidth is None"
+    assert phi[len(tiers) + 1] == 0.0, "has_bw should be 0.0 when bandwidth is None"
+    assert phi[len(tiers) + 2] == bandit_mod.DEFAULT_LOSS, "loss_feat should default to ln(10)"
+    assert phi[len(tiers) + 3] == 0.0, "has_loss should be 0.0 when data_utility is None"
+    print("PASS bandit features default gracefully with no bandwidth/loss info")
 
 
 def _fake_debt(rng, tier_ids=("0", "1", "2", "3")):
@@ -214,11 +340,16 @@ if __name__ == "__main__":
     test_greedy_update_is_noop()
     test_policies_registry_has_all_three()
     test_policies_gated_by_lambda()
-    test_bandit_is_still_a_structural_stub()
     test_lyapunov_degenerates_to_greedy_at_lambda_zero()
     test_lyapunov_protects_s_when_its_debt_dominates()
     test_lyapunov_reaches_high_when_upper_debt_dominates()
     test_lyapunov_missing_debt_raises()
     test_lyapunov_empty_tiers_raises()
     test_lyapunov_update_is_noop()
+    test_bandit_requires_debt_and_nonempty_tiers()
+    test_bandit_cold_start_ties_to_max_tier()
+    test_bandit_pending_lifecycle()
+    test_bandit_weights_move_toward_observed_reward()
+    test_bandit_epsilon_decays()
+    test_bandit_missing_bw_and_loss_default_gracefully()
     print("ALL PASS")

@@ -160,6 +160,7 @@ class FLOFA_Trainer(ABC):
             else:
                 policy_obj = POLICIES[policy_name](lam=lam)  # E3-gated, see policies/
             self.server_model.set_assignment_policy(policy_obj)
+            self._policy = policy_obj  # direct reference: trainer calls .update()
             logging.info(
                 "[policy] assignment_policy=%s active (lambda=%s)"
                 % (policy_name, lam)
@@ -741,6 +742,39 @@ class FLOFA_Trainer(ABC):
                         tx_report = self.comm_sim.transmit_plan(
                             round_num, client_idx, plan, is_max
                         )
+                        if self.args.subnet_dist_type == "policy_assign":
+                            # Learned-policy feedback (DIRECTION §3.2, E6): must
+                            # fire for EVERY resolved outcome, including total
+                            # failure below -- a complete loss is exactly the
+                            # signal a bandit needs to learn to avoid, not skip.
+                            # Placed before the delivers_nothing() continue so
+                            # neither path leaks an un-updated pending entry.
+                            from fedml_api.standalone.superfednas.comm_sim.policies import (
+                                DeliveryFeedback,
+                            )
+
+                            delivered_tier_id = (
+                                self._tier_id_for_config(tx_report.delivered_config)
+                                if tx_report.delivered_config is not None
+                                else None
+                            )
+                            self._policy.update(DeliveryFeedback(
+                                round_num=round_num,
+                                client_idx=client_idx,
+                                assigned_tier=self._tier_id_for_config(
+                                    client_model.model_config
+                                ),
+                                delivered_tier=delivered_tier_id,
+                                native_context=tx_report.completed_plan,
+                                native_bits=(
+                                    tx_report.bits_delivered
+                                    if tx_report.completed_plan else 0.0
+                                ),
+                                cross_context_bits=(
+                                    tx_report.bits_delivered
+                                    if not tx_report.completed_plan else 0.0
+                                ),
+                            ))
                         if tx_report.delivers_nothing():
                             continue  # not even the smallest clipped tier fits
                         intended_bits = plan.total_bits()
