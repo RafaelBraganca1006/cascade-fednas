@@ -154,6 +154,21 @@ class FLOFA_Trainer(ABC):
                     "--subnet_dist_type policy_assign requires --assignment_policy "
                     "in %s, got %r" % (list(POLICIES), policy_name)
                 )
+            if getattr(self.args, "tx_mode", "all_or_nothing") != "nested":
+                # DeliveryFeedback/update() and _mark_tier_debt_served only fire
+                # on the plain-nested transmit_plan() path below (round_forward
+                # loop). all_or_nothing never reaches it (no truncation report),
+                # and nested_shard's carrier branch + sub-floor shard fallback
+                # both bypass it too -- either combination would silently leave
+                # every assign()'d client's _pending entry never consumed (a
+                # bandit that never learns, frozen at cold start; a Lyapunov
+                # debt table that never marks tiers served) instead of a loud
+                # failure. Caught during a pre-submission audit, not by a crash.
+                raise ValueError(
+                    "--subnet_dist_type policy_assign only supports --tx_mode "
+                    "nested (delivery feedback isn't wired for %r) -- see the "
+                    "comment above." % getattr(self.args, "tx_mode", None)
+                )
             lam = getattr(self.args, "policy_lambda", None)
             if policy_name == "greedy":
                 policy_obj = POLICIES[policy_name]()  # no lambda dependency (Lemma 1)

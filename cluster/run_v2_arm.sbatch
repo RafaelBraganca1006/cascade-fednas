@@ -22,6 +22,10 @@
 #     # E5 Lyapunov -- POLICY_LAMBDA required for lyapunov/bandit (E3-gated,
 #     # DIRECTION §3.2: small, not derived precisely -- exploratory starting
 #     # point, not a calibrated value; sweep later if warranted)
+#   sbatch cluster/run_v2_arm.sbatch 20 nested 150 policy_assign none bandit maxnetfix 0.1
+#     # E6 bandit -- TX_MODE must be "nested" for any ASSIGNMENT_POLICY (the
+#     # trainer hard-errors otherwise: DeliveryFeedback/update() only wires
+#     # up on the plain-nested path, see DIRECTION §3.2 pre-submission audit)
 #
 # Same model/subnets/schedule/seeds as run_sweep / run_phase3 -> directly
 # comparable across arms and with the v1 characterization runs (when

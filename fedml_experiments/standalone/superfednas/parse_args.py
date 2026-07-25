@@ -626,11 +626,11 @@ def add_args(parser):
         default="none",
         choices=["none", "greedy", "lyapunov", "bandit"],
         help="Only used when --subnet_dist_type policy_assign (DIRECTION §3.2, "
-        "retargeted 2026-07-22): which AssignmentPolicy decides each client's "
-        "tier under nested transmission. 'greedy' is the lambda=0 optimum "
-        "(Lemma 1, no E3 dependency, functional today); 'lyapunov'/'bandit' "
-        "need --policy_lambda from the E3 ablation and are structural stubs "
-        "until their reward/context wiring lands (see comm_sim/policies/).",
+        "retargeted 2026-07-22), and requires --tx_mode nested. Which "
+        "AssignmentPolicy decides each client's tier under nested "
+        "transmission. 'greedy' is the lambda=0 optimum (Lemma 1, no E3 "
+        "dependency); 'lyapunov'/'bandit' are both fully implemented and "
+        "need --policy_lambda from the E3 ablation (see comm_sim/policies/).",
     )
     parser.add_argument(
         "--policy_lambda",
