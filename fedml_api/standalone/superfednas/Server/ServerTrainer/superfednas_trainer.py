@@ -89,6 +89,10 @@ class FLOFA_Trainer(ABC):
                 # profiles, optionally correlated with the client's label
                 # distribution (--bw_data_corr, digital-divide stress test).
                 cls_counts = self._client_class_counts()
+                # kept for the inclusion-gap metric (class-distribution-weighted
+                # global accuracy per connectivity group -- see
+                # _log_inclusion_gap); computed once here, never recomputed.
+                self._cls_counts = cls_counts
                 client_tiers = assign_connectivity_tiers(
                     cls_counts,
                     corr=getattr(self.args, "bw_data_corr", 0.0),
@@ -172,6 +176,8 @@ class FLOFA_Trainer(ABC):
         # dead-slot / inclusion-gap metrics EXPERIMENTS.md now requires on every
         # run), but _client_sampling only consults a policy when one is set.
         self._min_tier_bits_cache = None
+        if not hasattr(self, "_cls_counts"):
+            self._cls_counts = None  # only set under a tiered bw profile above
         self._client_delivered_counts = {
             c: {} for c in range(self.args.client_num_in_total)
         }
@@ -553,9 +559,14 @@ class FLOFA_Trainer(ABC):
         """Per-class test accuracy of each monitored tier probe on the global
         test set (--log_per_class). Feeds the class x method heatmap and the
         per-class-hole analysis under bandwidth-data correlation (E4). One
-        compact parseable line per tier + wandb series."""
+        compact parseable line per tier + wandb series.
+
+        Returns {tier_name: per-class accuracy array} so _log_inclusion_gap can
+        reuse it instead of running its own (and, before 2026-07-26, useless)
+        per-client eval pass. {} when disabled."""
         if not getattr(self.args, "log_per_class", False):
-            return
+            return {}
+        per_class_acc = {}
         device = self.client_trainer.device
         for subnet_arch in self.args.ckpt_subnets:
             tier = self._tier_name(subnet_arch) or str(subnet_arch)
@@ -581,6 +592,7 @@ class FLOFA_Trainer(ABC):
                         total_hits, minlength=len(correct)
                     ).float()
             acc = (correct / total.clamp(min=1)).cpu().numpy()
+            per_class_acc[tier] = acc
             logging.info(
                 "[per_class] round %d %s acc=%s"
                 % (round_idx, tier, np.round(acc, 4).tolist())
@@ -595,6 +607,7 @@ class FLOFA_Trainer(ABC):
                 },
                 step=round_idx,
             )
+        return per_class_acc
 
     def _record_delivery(self, round_num, client_idx, delivered_tier_id):
         """One client's resolved outcome, for the selection layer's coverage
@@ -640,70 +653,84 @@ class FLOFA_Trainer(ABC):
                min(totals) if totals else 0, max(totals) if totals else 0, never)
         )
 
-    def _log_inclusion_gap(self, round_idx):
+    def _log_inclusion_gap(self, round_idx, per_class_acc):
         """Accuracy gap between the worst- and best-connectivity client groups
-        (DIRECTION §2 secondary claim), evaluated on each group's OWN local test
-        data -- a global-test-set number cannot express it.
+        (DIRECTION §2 secondary claim), as a CLASS-DISTRIBUTION-WEIGHTED read of
+        the global test set:
 
-        Opt-in via --log_inclusion_gap because it needs a per-client pass that
-        --efficient_test deliberately skips. Required on every E6b run: a
-        selection policy that wins mean accuracy while widening this gap is
-        publishing the digital-divide pathology as its solution, and that must
-        surface in week one, not in the write-up.
+            acc(group) = sum_c  p_group(c) * per_class_acc(c)
 
-        !! CALL ORDERING CONSTRAINT -- this must be the LAST thing in its eval
-        branch. It repoints client_trainer's local dataset per client and does
-        not restore it, and the `mean_acc` loop that produces final_test_acc
-        calls local_test(True) WITHOUT setting a dataset first (it relies on
-        whatever the preceding eval left loaded). Calling this before that loop
-        silently measures the headline metric on the last client's local test
-        split instead, changing final_test_acc between runs that differ only by
-        this flag -- exactly the kind of invisible invalidation the E6b test
-        discipline exists to prevent.
+        where p_group(c) is the aggregate label distribution of the clients in
+        that connectivity group. It answers "how well does the model serve the
+        data held by poorly-connected clients", which is what the inclusion gap
+        means, without needing a per-client test split.
+
+        **Why not per-client local test sets (the obvious implementation, tried
+        and discarded 2026-07-26 after the E6b smoke run job 103620):**
+        `get_dataloader_CIFAR10` builds the test dataset WITHOUT `dataidxs`
+        (fedml_api/data_preprocessing/cifar10/data_loader.py), so every client's
+        `test_data_local_dict[c]` is the identical full CIFAR-10 test set --
+        only the TRAIN set is partitioned. Evaluating per client therefore
+        returns the same number for every group (the smoke printed
+        {'poor': 0.1753, 'average': 0.1753, 'good': 0.1753} for every tier and
+        round) while costing 20 clients x 4 tiers = 80 full test-set passes per
+        checkpoint. The metric was structurally unmeasurable, not merely
+        mis-scaled. Partitioning the test set would be the alternative, but
+        `test_data_local_dict[0]` is what the mean_acc loop evaluates
+        final_test_acc on, so changing it would silently redefine the headline
+        metric of every future run and break comparability with results/.
+
+        This version is free: it reuses the per-class accuracies
+        `--log_per_class` already computes and the label histograms
+        `_client_class_counts()` already built at init. It also has no call-
+        ordering hazard, since it touches neither the model nor the dataloaders.
+
+        Honest reading for the write-up: under corr=0 the groups hold similar
+        class mixes, so the gap is near zero BY CONSTRUCTION and a policy cannot
+        move it much -- the metric earns its keep under corr>0 (the
+        digital-divide setting), which is exactly where DIRECTION §2 invokes it.
         """
-        if not getattr(self.args, "log_inclusion_gap", False):
+        if not getattr(self.args, "log_inclusion_gap", False) or not per_class_acc:
             return
         tiers = getattr(getattr(self.comm_sim, "bw", None), "client_tiers", None)
-        if tiers is None:
+        if tiers is None or self._cls_counts is None:
             return  # only meaningful under a tiered connectivity profile
         from fedml_api.standalone.superfednas.comm_sim import MarkovBandwidth
 
-        for subnet_arch in self.args.ckpt_subnets:
-            name = self._tier_name(subnet_arch) or str(subnet_arch)
-            self.client_trainer.set_test_model(
-                self.server_model.get_subnet(**subnet_arch),
+        # aggregate label distribution per connectivity group
+        group_dist = {}
+        for client_idx, tier in enumerate(tiers):
+            counts = self._cls_counts.get(client_idx)
+            if counts is None:
+                continue
+            grp = MarkovBandwidth.TIER_NAMES[tier]
+            acc = group_dist.get(grp)
+            group_dist[grp] = counts.astype(float) if acc is None else acc + counts
+        group_dist = {
+            g: v / max(v.sum(), 1.0) for g, v in group_dist.items() if v.sum() > 0
+        }
+        if "poor" not in group_dist or "good" not in group_dist:
+            return
+
+        for name, acc in per_class_acc.items():
+            accs = {}
+            for grp, dist in group_dist.items():
+                n = min(len(dist), len(acc))
+                accs[grp] = float((dist[:n] * acc[:n]).sum())
+            gap = accs["good"] - accs["poor"]
+            wandb.log(
+                {
+                    **{f"Inclusion/{name}/{g}": a for g, a in accs.items()},
+                    f"Inclusion/{name}/gap": gap,
+                    "round": round_idx,
+                },
+                step=round_idx,
             )
-            by_conn = {}
-            for client_idx in range(self.args.client_num_in_total):
-                if self.test_data_local_dict[client_idx] is None:
-                    continue
-                self.client_trainer.update_local_dataset(
-                    client_idx,
-                    self.train_data_local_dict[client_idx],
-                    self.test_data_local_dict[client_idx],
-                    self.train_data_local_num_dict[client_idx],
-                )
-                m = self.client_trainer.local_test(True)
-                grp = MarkovBandwidth.TIER_NAMES[tiers[client_idx]]
-                agg = by_conn.setdefault(grp, [0, 0])
-                agg[0] += m["test_correct"]
-                agg[1] += m["test_total"]
-            accs = {g: c / max(t, 1) for g, (c, t) in by_conn.items()}
-            if "poor" in accs and "good" in accs:
-                gap = accs["good"] - accs["poor"]
-                wandb.log(
-                    {
-                        **{f"Inclusion/{name}/{g}": a for g, a in accs.items()},
-                        f"Inclusion/{name}/gap": gap,
-                        "round": round_idx,
-                    },
-                    step=round_idx,
-                )
-                logging.info(
-                    "[inclusion] round %d %s %s gap(good-poor)=%.4f"
-                    % (round_idx, name,
-                       {g: round(a, 4) for g, a in accs.items()}, gap)
-                )
+            logging.info(
+                "[inclusion] round %d %s %s gap(good-poor)=%+.4f"
+                % (round_idx, name,
+                   {g: round(a, 4) for g, a in sorted(accs.items())}, gap)
+            )
 
     def _allocate_shards(self, round_num, client_indexes):
         """Shard-carrier allocation for this round (nested_shard mode).
@@ -1297,8 +1324,8 @@ class FLOFA_Trainer(ABC):
                 self._efficient_local_test_on_all_clients(round_num)
             else:
                 self._local_test_on_all_clients(round_num)
-            self._log_per_class_acc(round_num)
-            self._log_inclusion_gap(round_num)
+            _pc = self._log_per_class_acc(round_num)
+            self._log_inclusion_gap(round_num, _pc)
         # per {frequency_of_the_test} round
         elif round_num % self.args.frequency_of_the_test == 0:
             if self.args.efficient_test:
@@ -1307,7 +1334,7 @@ class FLOFA_Trainer(ABC):
                 )
             else:
                 _, subnet_test_acc_map = self._local_test_on_all_clients(round_num)
-            self._log_per_class_acc(round_num)
+            _pc = self._log_per_class_acc(round_num)
             mean_acc = 0.0
             for subnet_arch in self.args.ckpt_subnets:
                 self.client_trainer.set_test_model(
@@ -1341,10 +1368,7 @@ class FLOFA_Trainer(ABC):
                         self.args.ofa_config,
                         self.args.model,
                     )
-            # MUST stay last in this branch -- see _log_inclusion_gap's docstring:
-            # it repoints client_trainer's local dataset, and the mean_acc loop
-            # above calls local_test(True) WITHOUT setting one.
-            self._log_inclusion_gap(round_num)
+            self._log_inclusion_gap(round_num, _pc)
         # Checkpointing
         if round_num > 0 and round_num % self.args.model_checkpoint_freq == 0:
             self.server_model.save(
