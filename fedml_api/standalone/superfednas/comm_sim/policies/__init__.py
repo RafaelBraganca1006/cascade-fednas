@@ -15,6 +15,19 @@ POLICIES = {
     "bandit": ContextualBanditPolicy,
 }
 
+# Selected by --selection_policy. DIFFERENT decision surface from POLICIES
+# above: which clients are in the round at all, not which tier a selected
+# client trains (DIRECTION §3.2b). The two entries are Stage 1 leverage probes,
+# not deployable policies -- see selection.py's docstring on why they are NOT
+# ceilings.
+from .selection import (  # noqa: E402
+    SELECTION_POLICIES,
+    CoverageSelector,
+    OracleBandwidthSelector,
+    SelectionContext,
+    SelectionPolicy,
+)
+
 __all__ = [
     "AssignmentContext",
     "AssignmentPolicy",
@@ -24,4 +37,9 @@ __all__ = [
     "LyapunovPolicy",
     "ContextualBanditPolicy",
     "POLICIES",
+    "SelectionPolicy",
+    "SelectionContext",
+    "OracleBandwidthSelector",
+    "CoverageSelector",
+    "SELECTION_POLICIES",
 ]

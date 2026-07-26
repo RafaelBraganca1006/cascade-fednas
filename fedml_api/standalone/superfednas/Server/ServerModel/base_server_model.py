@@ -534,6 +534,37 @@ class BaseServerModel(ABC):
             self.cli_subnet_track[client_idx]["smallest"] += 1
         return self.get_subnet(**arch_config)
 
+    def random_subnet_arch_under(self, cap_config):
+        """A random elastic arch, clipped by a size CAP (E6b, DIRECTION §3.2b).
+
+        This is the action the retargeted policy takes: not "train tier k", but
+        "train anything up to size k". The clip is the same alpha ^ tier
+        intersection the transmission layer already uses (comm_sim.transmission.
+        clip_arch_config, min per stage/block), so the result is a valid OFA
+        config nested inside the cap.
+
+        THE property this exists for: at cap = the max tier the clip is the
+        IDENTITY (every d <= 2, every e <= 0.25), and the numpy draw sequence is
+        untouched, so `cap = XL` reproduces TS_all_random BIT-IDENTICALLY. Blind
+        sampling is therefore a member of the policy class, which is what makes
+        a loss attributable to the policy rather than to a restricted action
+        space -- the confound that invalidated the E5/E6 blind comparison
+        (DIRECTION §3.2b fact 4).
+
+        Note what this does NOT give: reachability is not a performance floor.
+        The policy optimizes its reward, not accuracy, and will leave cap = XL
+        confidently if the reward is misaligned -- exactly what the v1 bandit
+        did. Asserted by selftest_selection.py::test_cap_max_equals_blind.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.transmission import (
+            clip_arch_config,
+        )
+
+        arch_config = self.random_subnet_arch()
+        if cap_config is None:
+            return arch_config
+        return clip_arch_config(arch_config, cap_config)
+
     def crossover_sample(self, par1, par2):
         new_sample = copy.deepcopy(par1)
         for key in new_sample.keys():

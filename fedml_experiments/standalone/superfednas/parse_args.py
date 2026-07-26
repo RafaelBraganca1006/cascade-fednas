@@ -633,6 +633,22 @@ def add_args(parser):
         "need --policy_lambda from the E3 ablation (see comm_sim/policies/).",
     )
     parser.add_argument(
+        "--selection_policy",
+        type=str,
+        default="none",
+        choices=["none", "oracle_bandwidth", "coverage"],
+        help="E6b Stage 1 leverage probes (EXPERIMENTS.md, DIRECTION §3.2b): "
+        "WHICH clients participate each round, the decision _client_sampling "
+        "makes uniformly at random today. 'none' = the legacy uniform draw, "
+        "bit-identical to every archived run. 'oracle_bandwidth' pushes the "
+        "bandwidth signal to its extreme (top-K by true current bandwidth); "
+        "'coverage' pushes the staleness signal to its extreme (maximise the "
+        "minimum delivered-coverage). These are NOT ceilings/upper bounds — "
+        "oracle_bandwidth can easily land BELOW blind under non-IID, and that "
+        "is an informative result. They measure whether the 'who participates' "
+        "axis carries any signal at all before an RL is built on it.",
+    )
+    parser.add_argument(
         "--policy_lambda",
         type=float,
         default=None,
@@ -667,11 +683,30 @@ def add_args(parser):
         "--bw_profile",
         type=str,
         default="uniform",
-        choices=["uniform", "tiered"],
+        choices=["uniform", "tiered", "tiered_continuous"],
         help="Connectivity heterogeneity (E4). uniform: every client has the "
         "same Markov dynamics (legacy — no client is persistently "
         "disadvantaged). tiered: persistent per-client profiles "
-        "(poor/average/good dwell dynamics over the same states).",
+        "(poor/average/good dwell dynamics over the same states). "
+        "tiered_continuous (E6b, 2026-07-26): tiered + log-normal spread "
+        "WITHIN each state, so the budget is continuous and the whole tier "
+        "ladder is reachable. With three discrete states there are only three "
+        "possible budgets at any deadline, so at least one tier is always "
+        "unreachable — the structural cause of the degenerate assignment "
+        "problem found in the policy audit (DIRECTION §3.2b). Mean bandwidth "
+        "is unchanged vs tiered; only variance differs.",
+    )
+    parser.add_argument(
+        "--bw_jitter_sigma",
+        type=float,
+        default=0.45,
+        help="Log-normal within-state spread for --bw_profile "
+        "tiered_continuous. Chosen by analysis/pick_deadline.py: at 0.45 with "
+        "--bw_deadline 40 every tier is reachable and ~35%% of participation "
+        "slots stay structurally dead (the lever the selection policy "
+        "reclaims). Below ~0.35 the M tier dies again; above ~0.6 the good "
+        "state's tail stops being physical. Exploratory, to be calibrated "
+        "against the Irish traces' within-regime variance when E9 lands.",
     )
     parser.add_argument(
         "--bw_data_corr",
@@ -687,6 +722,16 @@ def add_args(parser):
         action="store_true",
         help="Log per-class test accuracy of each tier probe at every eval "
         "checkpoint (class x method heatmap data, E4).",
+    )
+    parser.add_argument(
+        "--log_inclusion_gap",
+        action="store_true",
+        help="Log the accuracy gap between the worst- and best-connectivity "
+        "client groups, on their OWN local test data (DIRECTION §2 secondary "
+        "claim). Needs a per-client eval pass that --efficient_test skips, so "
+        "it is opt-in. REQUIRED on every E6b selection run: a policy that wins "
+        "mean accuracy while widening this gap is publishing the digital-divide "
+        "pathology as its solution. No-op unless --bw_profile is tiered*.",
     )
 
     return parser

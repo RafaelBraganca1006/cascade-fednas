@@ -84,7 +84,7 @@ class FLOFA_Trainer(ABC):
                 assign_connectivity_tiers,
             )
 
-            if getattr(self.args, "bw_profile", "uniform") == "tiered":
+            if getattr(self.args, "bw_profile", "uniform").startswith("tiered"):
                 # Heterogeneous connectivity (E4): persistent per-client
                 # profiles, optionally correlated with the client's label
                 # distribution (--bw_data_corr, digital-divide stress test).
@@ -94,12 +94,25 @@ class FLOFA_Trainer(ABC):
                     corr=getattr(self.args, "bw_data_corr", 0.0),
                     seed=self.args.bw_seed,
                 )
-                bw_model = MarkovBandwidth.tiered(
-                    num_clients=self.args.client_num_in_total,
-                    num_rounds=self.args.comm_round,
-                    client_tiers=client_tiers,
-                    seed=self.args.bw_seed,
-                )
+                if self.args.bw_profile == "tiered_continuous":
+                    # E6b (DIRECTION §3.2b): continuous within-state spread, so
+                    # the whole tier ladder is reachable. Three discrete states
+                    # give only three budgets at any deadline, which is what
+                    # made the assignment problem degenerate.
+                    bw_model = MarkovBandwidth.tiered_continuous(
+                        num_clients=self.args.client_num_in_total,
+                        num_rounds=self.args.comm_round,
+                        client_tiers=client_tiers,
+                        seed=self.args.bw_seed,
+                        jitter_sigma=getattr(self.args, "bw_jitter_sigma", 0.45),
+                    )
+                else:
+                    bw_model = MarkovBandwidth.tiered(
+                        num_clients=self.args.client_num_in_total,
+                        num_rounds=self.args.comm_round,
+                        client_tiers=client_tiers,
+                        seed=self.args.bw_seed,
+                    )
                 by_tier = {
                     name: [c for c, t in enumerate(client_tiers) if t == i]
                     for i, name in enumerate(MarkovBandwidth.TIER_NAMES)
@@ -136,12 +149,55 @@ class FLOFA_Trainer(ABC):
                 assert not getattr(self.args, "feddyn", False), (
                     "nested transmission not supported with feddyn yet"
                 )
+            logging.info(
+                "[comm_sim] bandwidth spread: %s"
+                % (
+                    "continuous (jitter_sigma=%.2f)"
+                    % getattr(self.args, "bw_jitter_sigma", 0.45)
+                    if self.args.bw_profile == "tiered_continuous"
+                    else "discrete states"
+                )
+            )
             # lazy caches for the nested path (see _build_tx_plan / _slice_client_update)
             self._tier_cfgs = None
             self._scratch_server = None
             # lazy caches for the shard path (see _allocate_shards)
             self._unit_bits = None
             self._unit_last_round = None
+
+        # ---- client-SELECTION policy (E6b Stage 1, DIRECTION §3.2b) ----
+        # Different decision surface from the assignment policy below: WHICH
+        # clients are in the round, not which tier a selected client trains.
+        # These tables are maintained unconditionally (cheap, and they are the
+        # dead-slot / inclusion-gap metrics EXPERIMENTS.md now requires on every
+        # run), but _client_sampling only consults a policy when one is set.
+        self._min_tier_bits_cache = None
+        self._client_delivered_counts = {
+            c: {} for c in range(self.args.client_num_in_total)
+        }
+        self._client_last_delivery_round = {
+            c: -1 for c in range(self.args.client_num_in_total)
+        }
+        self._selection_policy = None
+        sel_name = getattr(self.args, "selection_policy", "none")
+        if sel_name != "none":
+            from fedml_api.standalone.superfednas.comm_sim.policies import (
+                SELECTION_POLICIES,
+            )
+
+            if self.comm_sim is None:
+                raise ValueError(
+                    "--selection_policy %r needs --comm_sim: without a bandwidth "
+                    "model there is no notion of a dead slot, which is the whole "
+                    "quantity these probes act on." % sel_name
+                )
+            self._selection_policy = SELECTION_POLICIES[sel_name]()
+            logging.info(
+                "[selection] selection_policy=%s active -- overriding the uniform "
+                "client draw (DIRECTION §3.2b). NOTE: the Stage 1 probes read "
+                "oracle bandwidth by design; they are diagnostics, not "
+                "deployable policies." % sel_name
+            )
 
         # ---- assignment policy ("policy_assign" sampler, DIRECTION §3.2,
         # retargeted 2026-07-22: "who trains what" under nested transmission) ----
@@ -288,8 +344,74 @@ class FLOFA_Trainer(ABC):
             client_indexes = np.random.choice(
                 range(client_num_in_total), num_clients, replace=False
             )
+            # ---- E6b: learned/probed client selection (DIRECTION §3.2b) ----
+            # Placed AFTER the legacy draw on purpose. The np.random.seed above
+            # reseeds the GLOBAL numpy stream, and every archived run's client
+            # sequence depends on this exact call order -- consuming randomness
+            # before it, or skipping the draw, silently changes WHICH clients
+            # participate in every round while still producing plausible
+            # accuracies, invalidating every cross-arm comparison in
+            # results/README.md. So the legacy path always runs, untouched, and
+            # the policy overrides its RESULT rather than replacing the draw.
+            # Cost: one wasted np.random.choice per round. Guarded by
+            # selftest_selection.py::test_legacy_selection_path_unchanged.
+            if self._selection_policy is not None:
+                client_indexes = self._policy_select_clients(
+                    round_idx, client_num_in_total, num_clients
+                )
         logging.info("client_indexes = %s" % str(client_indexes))
         return client_indexes
+
+    def _policy_select_clients(self, round_idx, client_num_in_total, num_clients):
+        """Build the SelectionContext and delegate (E6b Stage 1).
+
+        Candidates are ALL clients, not the legacy random subset -- the whole
+        point is that the policy re-decides who is in the round. The probes read
+        the true current-round bandwidth by design (they are diagnostics, see
+        comm_sim/policies/selection.py); a deployable policy must use the lagged
+        estimate, which is why both are wired here.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.policies import (
+            SelectionContext,
+        )
+
+        candidates = list(range(client_num_in_total))
+        bw_true, bw_est = {}, {}
+        if self.comm_sim is not None:
+            lag = max(round_idx - 1, 0)
+            for c in candidates:
+                bw_true[c] = self.comm_sim.bw.bandwidth(c, round_idx)
+                bw_est[c] = self.comm_sim.bw.bandwidth(c, lag)
+        ctx = SelectionContext(
+            bw_true_bps=bw_true,
+            bw_est_bps=bw_est,
+            min_tier_bits=self._min_tier_bits(),
+            upload_window_s=(
+                self.comm_sim.upload_window(0) if self.comm_sim is not None else None
+            ),
+            delivered_counts=self._client_delivered_counts,
+            last_round_seen=self._client_last_delivery_round,
+        )
+        chosen = self._selection_policy.select(
+            round_idx, candidates, num_clients, ctx
+        )
+        assert len(chosen) == num_clients and len(set(chosen)) == num_clients, (
+            "selection policy returned %d entries (%d distinct), expected %d"
+            % (len(chosen), len(set(chosen)), num_clients)
+        )
+        return list(chosen)
+
+    def _min_tier_bits(self):
+        """Payload of the smallest tier -- the dead-slot threshold. A client
+        whose budget is below this delivers nothing whatever it is assigned."""
+        if self.comm_sim is None:
+            return None
+        if self._min_tier_bits_cache is None:
+            cfgs = self._tier_ladder_configs()
+            self._min_tier_bits_cache = self.comm_sim.payload_bits(
+                self.server_model.get_subnet(**cfgs[0])
+            )
+        return self._min_tier_bits_cache
 
     # ---- dynFedNAS v2: nested anytime transmission (Stage 1) ----
     def _tier_ladder_configs(self):
@@ -474,6 +596,115 @@ class FLOFA_Trainer(ABC):
                 step=round_idx,
             )
 
+    def _record_delivery(self, round_num, client_idx, delivered_tier_id):
+        """One client's resolved outcome, for the selection layer's coverage
+        tables and the dead-slot metric (EXPERIMENTS.md measurement rules,
+        2026-07-26). Maintained on EVERY run, not only when a selection policy
+        is active -- the blind baseline's numbers are exactly what the probes
+        are compared against, so they have to be collected the same way.
+
+        delivered_tier_id: the diverse_subnets key that arrived, or None if the
+        client delivered nothing (a dead slot).
+        """
+        if delivered_tier_id is None:
+            return
+        counts = self._client_delivered_counts.setdefault(client_idx, {})
+        counts[delivered_tier_id] = counts.get(delivered_tier_id, 0) + 1
+        self._client_last_delivery_round[client_idx] = round_num
+
+    def _log_selection_metrics(self, round_num, selected, delivered_clients):
+        """[selection] round line: dead slots + coverage spread. This is the
+        `fig_dead_slots` data and the only visibility into whether a selection
+        policy is actually reclaiming wasted slots or just moving them."""
+        dead = [c for c in selected if c not in delivered_clients]
+        totals = [
+            sum(self._client_delivered_counts.get(c, {}).values())
+            for c in range(self.args.client_num_in_total)
+        ]
+        never = sum(1 for t in totals if t == 0)
+        wandb.log(
+            {
+                "selection/dead_slots": len(dead),
+                "selection/dead_slot_rate": len(dead) / max(len(selected), 1),
+                "selection/coverage_min": min(totals) if totals else 0,
+                "selection/coverage_max": max(totals) if totals else 0,
+                "selection/clients_never_delivered": never,
+                "round": round_num,
+            },
+            step=round_num,
+        )
+        logging.info(
+            "[selection] round %d: selected=%d dead=%d (%s) coverage_min=%d "
+            "coverage_max=%d never_delivered=%d"
+            % (round_num, len(selected), len(dead), sorted(dead),
+               min(totals) if totals else 0, max(totals) if totals else 0, never)
+        )
+
+    def _log_inclusion_gap(self, round_idx):
+        """Accuracy gap between the worst- and best-connectivity client groups
+        (DIRECTION §2 secondary claim), evaluated on each group's OWN local test
+        data -- a global-test-set number cannot express it.
+
+        Opt-in via --log_inclusion_gap because it needs a per-client pass that
+        --efficient_test deliberately skips. Required on every E6b run: a
+        selection policy that wins mean accuracy while widening this gap is
+        publishing the digital-divide pathology as its solution, and that must
+        surface in week one, not in the write-up.
+
+        !! CALL ORDERING CONSTRAINT -- this must be the LAST thing in its eval
+        branch. It repoints client_trainer's local dataset per client and does
+        not restore it, and the `mean_acc` loop that produces final_test_acc
+        calls local_test(True) WITHOUT setting a dataset first (it relies on
+        whatever the preceding eval left loaded). Calling this before that loop
+        silently measures the headline metric on the last client's local test
+        split instead, changing final_test_acc between runs that differ only by
+        this flag -- exactly the kind of invisible invalidation the E6b test
+        discipline exists to prevent.
+        """
+        if not getattr(self.args, "log_inclusion_gap", False):
+            return
+        tiers = getattr(getattr(self.comm_sim, "bw", None), "client_tiers", None)
+        if tiers is None:
+            return  # only meaningful under a tiered connectivity profile
+        from fedml_api.standalone.superfednas.comm_sim import MarkovBandwidth
+
+        for subnet_arch in self.args.ckpt_subnets:
+            name = self._tier_name(subnet_arch) or str(subnet_arch)
+            self.client_trainer.set_test_model(
+                self.server_model.get_subnet(**subnet_arch),
+            )
+            by_conn = {}
+            for client_idx in range(self.args.client_num_in_total):
+                if self.test_data_local_dict[client_idx] is None:
+                    continue
+                self.client_trainer.update_local_dataset(
+                    client_idx,
+                    self.train_data_local_dict[client_idx],
+                    self.test_data_local_dict[client_idx],
+                    self.train_data_local_num_dict[client_idx],
+                )
+                m = self.client_trainer.local_test(True)
+                grp = MarkovBandwidth.TIER_NAMES[tiers[client_idx]]
+                agg = by_conn.setdefault(grp, [0, 0])
+                agg[0] += m["test_correct"]
+                agg[1] += m["test_total"]
+            accs = {g: c / max(t, 1) for g, (c, t) in by_conn.items()}
+            if "poor" in accs and "good" in accs:
+                gap = accs["good"] - accs["poor"]
+                wandb.log(
+                    {
+                        **{f"Inclusion/{name}/{g}": a for g, a in accs.items()},
+                        f"Inclusion/{name}/gap": gap,
+                        "round": round_idx,
+                    },
+                    step=round_idx,
+                )
+                logging.info(
+                    "[inclusion] round %d %s %s gap(good-poor)=%.4f"
+                    % (round_idx, name,
+                       {g: round(a, 4) for g, a in accs.items()}, gap)
+                )
+
     def _allocate_shards(self, round_num, client_indexes):
         """Shard-carrier allocation for this round (nested_shard mode).
 
@@ -640,6 +871,9 @@ class FLOFA_Trainer(ABC):
         shard_assignment = {}
         if self.comm_sim is not None and self.comm_sim.tx_mode == "nested_shard":
             shard_assignment = self._allocate_shards(round_num, client_indexes)
+        # clients that delivered SOMETHING this round -- the complement inside
+        # client_indexes is the dead slots (E6b, see _log_selection_metrics)
+        delivered_clients = set()
 
         for idx in range(self.args.client_num_per_round):
             # update dataset
@@ -720,6 +954,11 @@ class FLOFA_Trainer(ABC):
                     )
                     if not delivered_units:
                         continue  # nothing fits: not trained, not aggregated
+                    delivered_clients.add(client_idx)
+                    self._record_delivery(
+                        round_num, client_idx,
+                        self._tier_id_for_config(client_model.model_config),
+                    )
                 elif self.comm_sim.tx_mode == "all_or_nothing":
                     is_max = self.server_model.is_max_net(client_model.model_config)
                     success, _ = self.comm_sim.transmit(
@@ -727,6 +966,11 @@ class FLOFA_Trainer(ABC):
                     )
                     if not success:
                         continue  # update would time out: not trained, not aggregated
+                    delivered_clients.add(client_idx)
+                    self._record_delivery(
+                        round_num, client_idx,
+                        self._tier_id_for_config(client_model.model_config),
+                    )
                 else:
                     is_max = self.server_model.is_max_net(client_model.model_config)
                     plan = self._build_tx_plan(client_model.model_config)
@@ -767,9 +1011,23 @@ class FLOFA_Trainer(ABC):
                         )
                         if not delivered_units:
                             continue  # budget below a single block: nothing fits
+                        delivered_clients.add(client_idx)
+                        # sub-floor fallback delivers loose blocks, not a
+                        # complete tier -- counts as "not a dead slot" but
+                        # refreshes no tier's coverage.
+                        self._record_delivery(round_num, client_idx, None)
                     else:
                         tx_report = self.comm_sim.transmit_plan(
                             round_num, client_idx, plan, is_max
+                        )
+                        # Needed by BOTH the policy feedback below and the
+                        # coverage/dead-slot tables (which are maintained on
+                        # every run, policy or not), so it is computed here
+                        # rather than inside the policy_assign branch.
+                        delivered_tier_id = (
+                            self._tier_id_for_config(tx_report.delivered_config)
+                            if tx_report.delivered_config is not None
+                            else None
                         )
                         if self.args.subnet_dist_type == "policy_assign":
                             # Learned-policy feedback (DIRECTION §3.2, E6): must
@@ -782,11 +1040,6 @@ class FLOFA_Trainer(ABC):
                                 DeliveryFeedback,
                             )
 
-                            delivered_tier_id = (
-                                self._tier_id_for_config(tx_report.delivered_config)
-                                if tx_report.delivered_config is not None
-                                else None
-                            )
                             self._policy.update(DeliveryFeedback(
                                 round_num=round_num,
                                 client_idx=client_idx,
@@ -806,6 +1059,10 @@ class FLOFA_Trainer(ABC):
                             ))
                         if tx_report.delivers_nothing():
                             continue  # not even the smallest clipped tier fits
+                        delivered_clients.add(client_idx)
+                        self._record_delivery(
+                            round_num, client_idx, delivered_tier_id
+                        )
                         intended_bits = plan.total_bits()
                         if intended_bits > 0:
                             delivery_completeness = min(
@@ -1008,6 +1265,8 @@ class FLOFA_Trainer(ABC):
                 "[policy] round %d: assigned=%s debt=%s"
                 % (round_num, policy_tier_counts, mean_debt)
             )
+        if self.comm_sim is not None:
+            self._log_selection_metrics(round_num, client_indexes, delivered_clients)
         if self.args.dry_run:
             avg_gflops /= self.args.client_num_per_round
             avg_params /= self.args.client_num_per_round
@@ -1039,6 +1298,7 @@ class FLOFA_Trainer(ABC):
             else:
                 self._local_test_on_all_clients(round_num)
             self._log_per_class_acc(round_num)
+            self._log_inclusion_gap(round_num)
         # per {frequency_of_the_test} round
         elif round_num % self.args.frequency_of_the_test == 0:
             if self.args.efficient_test:
@@ -1081,6 +1341,10 @@ class FLOFA_Trainer(ABC):
                         self.args.ofa_config,
                         self.args.model,
                     )
+            # MUST stay last in this branch -- see _log_inclusion_gap's docstring:
+            # it repoints client_trainer's local dataset, and the mean_acc loop
+            # above calls local_test(True) WITHOUT setting one.
+            self._log_inclusion_gap(round_num)
         # Checkpointing
         if round_num > 0 and round_num % self.args.model_checkpoint_freq == 0:
             self.server_model.save(

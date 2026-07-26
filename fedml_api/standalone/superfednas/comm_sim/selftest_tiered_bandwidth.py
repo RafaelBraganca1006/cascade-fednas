@@ -82,6 +82,67 @@ def test_corr_extremes():
     print("PASS corr extremes, fractions, determinism")
 
 
+def _bw_hash(model, n, r):
+    import hashlib
+    arr = np.array([[model.bandwidth(c, t) for t in range(r)] for c in range(n)])
+    return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
+
+
+def test_legacy_profiles_frozen():
+    """THE regression guard for the jitter change (2026-07-26).
+
+    Hashes captured from the pre-jitter implementation. default()/tiered() must
+    stay bit-identical forever: every archived run in results/ was produced with
+    them, and a silent change to the bandwidth trajectory would invalidate every
+    cross-arm comparison in results/README.md while still producing plausible
+    numbers. If this fails, the jitter path is consuming randomness on the
+    sigma=0 branch -- it must not.
+    """
+    d = bw.MarkovBandwidth.default(20, 150, seed=0)
+    t = bw.MarkovBandwidth.tiered(20, 150, [0] * 6 + [1] * 8 + [2] * 6, seed=0)
+    assert _bw_hash(d, 20, 150) == "50990d7fa8537c92", "default() trajectory CHANGED"
+    assert _bw_hash(t, 20, 150) == "1b9caaa7df6d722f", "tiered() trajectory CHANGED"
+    assert d.jitter_sigma == 0.0 and t.jitter_sigma == 0.0
+    print("PASS legacy default()/tiered() trajectories frozen (archive still valid)")
+
+
+def test_continuous_profile():
+    n, r = 20, 150
+    tiers = [0] * 6 + [1] * 8 + [2] * 6
+    disc = bw.MarkovBandwidth.tiered(n, r, tiers, seed=0)
+    cont = bw.MarkovBandwidth.tiered_continuous(n, r, tiers, seed=0)
+
+    # same chain: the sticky structure the policy learns from is untouched
+    assert (disc._traj == cont._traj).all(), "jitter perturbed the Markov chain"
+
+    d_arr = np.array([[disc.bandwidth(c, t) for t in range(r)] for c in range(n)])
+    c_arr = np.array([[cont.bandwidth(c, t) for t in range(r)] for c in range(n)])
+
+    # continuous: far more distinct values than the 3 discrete states
+    assert len(np.unique(np.round(c_arr, 3))) > 1000, len(np.unique(c_arr))
+    assert len(np.unique(np.round(d_arr, 3))) == 3
+
+    # mean preserved (median-normalized multiplier), variance increased
+    rel = abs(c_arr.mean() - d_arr.mean()) / d_arr.mean()
+    assert rel < 0.05, "jitter shifted mean bandwidth by %.1f%%" % (100 * rel)
+    assert c_arr.std() > d_arr.std()
+
+    # order-independence: repeated queries of the same (c, r) must agree, or a
+    # client would be sized against one bandwidth and charged at another
+    assert cont.bandwidth(3, 7) == cont.bandwidth(3, 7)
+    assert _bw_hash(cont, n, r) == _bw_hash(
+        bw.MarkovBandwidth.tiered_continuous(n, r, tiers, seed=0), n, r
+    ), "tiered_continuous not deterministic"
+
+    # tier ordering survives
+    means = [c_arr[[c for c in range(n) if tiers[c] == k]].mean() for k in (0, 1, 2)]
+    assert means[0] < means[1] < means[2], means
+    print("PASS continuous profile: %d distinct values, mean %.2f->%.2f Mbps, "
+          "std %.2f->%.2f Mbps, chain unchanged"
+          % (len(np.unique(np.round(c_arr, 3))), d_arr.mean() / 1e6,
+             c_arr.mean() / 1e6, d_arr.std() / 1e6, c_arr.std() / 1e6))
+
+
 def test_corr_interpolates():
     n = 40
     counts = _fake_counts(n)
@@ -102,6 +163,8 @@ def test_corr_interpolates():
 
 if __name__ == "__main__":
     test_default_unchanged_by_refactor()
+    test_legacy_profiles_frozen()
+    test_continuous_profile()
     test_tiers_are_persistently_different()
     test_corr_extremes()
     test_corr_interpolates()
