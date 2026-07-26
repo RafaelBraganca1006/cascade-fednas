@@ -147,6 +147,22 @@ class CommSimulator:
         self._cur["delivered_tiers"].append(report.delivered_tier)
         return report
 
+    def transmit_stream(self, round_num, client_idx, stream_plan, is_max_net):
+        """Block-granular stream (DIRECTION §3.1c): one ordered stream of
+        (shell, block) units, cut anywhere by the deadline, classified ex-post.
+        Returns a StreamDeliveryReport (see transmission.py)."""
+        from .transmission import truncate_stream
+
+        budget, bw = self.upload_budget_bits(client_idx, round_num)
+        report = truncate_stream(
+            stream_plan, budget, bw, self.upload_window(client_idx)
+        )
+        self._record(client_idx, is_max_net, stream_plan.total_bits(), report)
+        self._cur["delivered_tiers"].append(report.delivered_tier)
+        if report.leftover_blocks:
+            self._cur["units_delivered"] += len(report.leftover_blocks)
+        return report
+
     def transmit_shards(self, round_num, client_idx, shard_plan, is_max_net=False):
         """Carrier upload (nested_shard mode): whole shard units until the
         budget runs out. Returns (DeliveryReport, delivered unit ids)."""

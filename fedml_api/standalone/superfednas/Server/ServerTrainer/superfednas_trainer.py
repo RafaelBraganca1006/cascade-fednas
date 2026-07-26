@@ -216,7 +216,9 @@ class FLOFA_Trainer(ABC):
                     "--subnet_dist_type policy_assign requires --assignment_policy "
                     "in %s, got %r" % (list(POLICIES), policy_name)
                 )
-            if getattr(self.args, "tx_mode", "all_or_nothing") != "nested":
+            if getattr(self.args, "tx_mode", "all_or_nothing") not in (
+                "nested", "nested_blocks"
+            ):
                 # DeliveryFeedback/update() and _mark_tier_debt_served only fire
                 # on the plain-nested transmit_plan() path below (round_forward
                 # loop). all_or_nothing never reaches it (no truncation report),
@@ -228,8 +230,9 @@ class FLOFA_Trainer(ABC):
                 # failure. Caught during a pre-submission audit, not by a crash.
                 raise ValueError(
                     "--subnet_dist_type policy_assign only supports --tx_mode "
-                    "nested (delivery feedback isn't wired for %r) -- see the "
-                    "comment above." % getattr(self.args, "tx_mode", None)
+                    "nested / nested_blocks (delivery feedback isn't wired for "
+                    "%r) -- see the comment above."
+                    % getattr(self.args, "tx_mode", None)
                 )
             lam = getattr(self.args, "policy_lambda", None)
             if policy_name == "greedy":
@@ -447,6 +450,72 @@ class FLOFA_Trainer(ABC):
             lambda cfg: self.comm_sim.payload_bits(self.server_model.get_subnet(**cfg)),
         )
 
+    def _build_block_stream(self, arch_config, block_order=None):
+        """One client's block-granular stream (DIRECTION §3.1c).
+
+        Same clipped ladder the shell path uses (_build_tx_plan), materialised
+        as models so per-(shell, block) marginal payloads can be measured with
+        the same sizing rule the simulator charges.
+
+        block_order: {shell_idx: [block ids]} -- the policy layer's hook. Within
+        a shell the blocks are independent (no prefix semantics), so reordering
+        them is free; reordering ACROSS shells would trade the valid-subnet
+        guarantee for targeted coverage and is deliberately not exposed yet.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.sharding import (
+            build_block_stream,
+        )
+        from fedml_api.standalone.superfednas.comm_sim.transmission import (
+            clip_arch_config,
+        )
+
+        clipped = [
+            clip_arch_config(arch_config, tier)
+            for tier in self._tier_ladder_configs()
+        ]
+        models = [self.server_model.get_subnet(**cfg) for cfg in clipped]
+        return build_block_stream(
+            models, clipped, bytes_per_param=self.comm_sim.bytes_per_param,
+            block_order=block_order,
+        )
+
+    def _stream_updates(self, trained_model, report, plan):
+        """Turn one StreamDeliveryReport into aggregation-ready updates.
+
+        Produces up to two DISJOINT parts (see ShardedUpdate's docstring on why
+        disjointness matters): the complete shell prefix as a tier-k subnet
+        update minus the blocks that outran it, plus those blocks at their own
+        width. When nothing outran the prefix this is exactly one plain sliced
+        model -- byte-identical to what the frozen `nested` path emits.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.sharding import ShardedUpdate
+
+        updates = []
+        leftover = report.leftover_blocks
+        if report.delivered_tier >= 0:
+            sliced = self._slice_client_update(trained_model, report.delivered_config)
+            if leftover:
+                updates.append(
+                    ShardedUpdate(sliced, None, exclude_block_ids=set(leftover),
+                                  include_other=True)
+                )
+            else:
+                updates.append(sliced)  # identical to the shell path
+        # blocks that got further than the prefix, grouped by the width reached
+        by_level = {}
+        for block, level in leftover.items():
+            by_level.setdefault(level, []).append(block)
+        for level, blocks in by_level.items():
+            # the CLIPPED config the stream was built from (alpha ^ tier), not
+            # the raw ladder tier -- the client only ever trained the clipped
+            # arch, so slicing to the unclipped tier would fabricate width it
+            # never had
+            sliced = self._slice_client_update(trained_model, plan.tier_configs[level])
+            updates.append(
+                ShardedUpdate(sliced, blocks, include_other=False)
+            )
+        return updates
+
     def _slice_client_update(self, trained_model, beta_config):
         """Extract the delivered tier β ⊆ α from a trained α update.
 
@@ -501,6 +570,22 @@ class FLOFA_Trainer(ABC):
         -- one delivery event, two views of it."""
         for k in range(delivered_tier_idx + 1):
             tier_id = self._tier_id_for_config(plan.tiers[k][1])
+            if tier_id is not None:
+                self._tier_last_round[tier_id] = round_num
+                self._client_tier_last_round[client_idx][tier_id] = round_num
+
+    def _mark_stream_debt_served(self, round_num, client_idx, plan, report):
+        """Debt bookkeeping for the block stream (mirrors _mark_tier_debt_served).
+
+        A tier counts as served when the complete shell prefix reached it. The
+        leftover blocks deliberately do NOT mark their tier served: they cover
+        only part of that tier's width, so treating them as a full refresh would
+        make the debt table claim coverage the aggregate never got -- the same
+        over-claiming that made the v1 policies chase a signal disconnected from
+        reality.
+        """
+        for k in range(report.delivered_tier + 1):
+            tier_id = self._tier_id_for_config(plan.tier_configs[k])
             if tier_id is not None:
                 self._tier_last_round[tier_id] = round_num
                 self._client_tier_last_round[client_idx][tier_id] = round_num
@@ -912,6 +997,11 @@ class FLOFA_Trainer(ABC):
             # branches on a DIFFERENT client this same round never leaks in
             # (several branches below reuse local variable names like `plan`).
             delivery_completeness = 1.0
+            # same hygiene: the block-stream branch below assigns this, and the
+            # post-training aggregation reads it -- an un-reset value from a
+            # PREVIOUS client that took a different branch would silently slice
+            # this client's update against the wrong ladder.
+            stream_plan = None
 
             self.client_trainer.update_local_dataset(
                 client_idx,
@@ -986,6 +1076,67 @@ class FLOFA_Trainer(ABC):
                         round_num, client_idx,
                         self._tier_id_for_config(client_model.model_config),
                     )
+                elif self.comm_sim.tx_mode == "nested_blocks":
+                    # DIRECTION §3.1c: one block-granular stream, cut anywhere,
+                    # classified ex-post. Unlike the shell path a client whose
+                    # budget is below the smallest tier still contributes whole
+                    # blocks -- the 34.8%-of-slots-deliver-nothing problem.
+                    is_max = self.server_model.is_max_net(client_model.model_config)
+                    stream_plan = self._build_block_stream(client_model.model_config)
+                    tx_report = self.comm_sim.transmit_stream(
+                        round_num, client_idx, stream_plan, is_max
+                    )
+                    if self.args.subnet_dist_type == "policy_assign":
+                        # MUST fire before the delivers_nothing() continue and
+                        # on every resolved outcome: an assign() without a
+                        # matching update() leaks a _pending entry forever and
+                        # the bandit silently freezes at cold start. Exactly the
+                        # gap the 2026-07-25 audit found on the shell path;
+                        # re-introducing it here would be the same bug twice.
+                        from fedml_api.standalone.superfednas.comm_sim.policies import (
+                            DeliveryFeedback,
+                        )
+
+                        self._policy.update(DeliveryFeedback(
+                            round_num=round_num,
+                            client_idx=client_idx,
+                            assigned_tier=self._tier_id_for_config(
+                                client_model.model_config
+                            ),
+                            delivered_tier=(
+                                self._tier_id_for_config(tx_report.delivered_config)
+                                if tx_report.delivered_config is not None else None
+                            ),
+                            native_context=tx_report.completed_plan,
+                            native_bits=(
+                                tx_report.bits_delivered
+                                if tx_report.completed_plan else 0.0
+                            ),
+                            cross_context_bits=(
+                                tx_report.bits_delivered
+                                if not tx_report.completed_plan else 0.0
+                            ),
+                        ))
+                    if tx_report.delivers_nothing():
+                        continue  # not even one whole block fit
+                    delivered_clients.add(client_idx)
+                    self._record_delivery(
+                        round_num, client_idx,
+                        self._tier_id_for_config(tx_report.delivered_config)
+                        if tx_report.delivered_config is not None else None,
+                    )
+                    intended_bits = stream_plan.total_bits()
+                    if intended_bits > 0:
+                        delivery_completeness = min(
+                            tx_report.bits_delivered / intended_bits, 1.0
+                        )
+                    if (
+                        self.args.subnet_dist_type == "policy_assign"
+                        and tx_report.delivered_tier is not None
+                    ):
+                        self._mark_stream_debt_served(
+                            round_num, client_idx, stream_plan, tx_report
+                        )
                 elif self.comm_sim.tx_mode == "all_or_nothing":
                     is_max = self.server_model.is_max_net(client_model.model_config)
                     success, _ = self.comm_sim.transmit(
@@ -1202,6 +1353,29 @@ class FLOFA_Trainer(ABC):
                         % (role, client_idx, len(delivered_units))
                     )
                 w_locals.append(ShardedUpdate(updated_cli_model, delivered_units))
+                continue
+            # block stream: up to TWO disjoint updates from the same client --
+            # the complete shell prefix as a tier-k subnet, plus the blocks that
+            # outran it at their own width (DIRECTION §3.1c, _stream_updates)
+            if (
+                self.comm_sim is not None
+                and self.comm_sim.tx_mode == "nested_blocks"
+                and tx_report is not None
+            ):
+                parts = self._stream_updates(
+                    updated_cli_model, tx_report, stream_plan
+                )
+                for part in parts:
+                    part.set_avg_wt(maxnet_weight)
+                w_locals.extend(parts)
+                if self.args.verbose and tx_report.leftover_blocks:
+                    logging.info(
+                        "[comm_sim] client %d stream: tier %d prefix + %d "
+                        "leftover blocks %s"
+                        % (client_idx, tx_report.delivered_tier,
+                           len(tx_report.leftover_blocks),
+                           sorted(tx_report.leftover_blocks.items())[:6])
+                    )
                 continue
             # nested transmission: the deadline delivered only tier β ⊂ α —
             # aggregate the β-slice of the trained weights (anytime property)

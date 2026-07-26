@@ -142,9 +142,31 @@ class ShardedUpdate:
     they are tiny and stay covered by the shell path.
     """
 
-    def __init__(self, client_model, delivered_block_ids):
+    def __init__(self, client_model, delivered_block_ids, exclude_block_ids=None,
+                 include_other=False):
+        """delivered_block_ids: blocks to keep (None = keep all blocks).
+
+        exclude_block_ids / include_other added for the block stream
+        (DIRECTION §3.1c). A stream client can produce TWO updates at once --
+        a tier-k subnet prefix plus blocks that outran it at a larger width --
+        and those two overlap on the prefix's coordinates. Emitting both
+        unfiltered would count the client's value TWICE on the overlap: same
+        value, so the weighted mean is unchanged, but the client's INFLUENCE on
+        those coordinates doubles relative to everyone else. That is the exact
+        class of silent mis-weighting the MaxNet beta-travels-with-the-slot bug
+        already cost this project (§3.3), so the two parts are made disjoint by
+        block instead: the prefix excludes the leftover blocks, the leftovers
+        carry them at their own level. Both are plain key filters -- no channel
+        slice arithmetic, no BN mismatch (sharding.py's granularity argument).
+
+        include_other keeps stem/classifier keys, which the prefix part needs
+        (they are part of a valid subnet) and the leftover parts must not
+        duplicate.
+        """
         self._client_model = client_model
-        self._units = set(delivered_block_ids)
+        self._units = None if delivered_block_ids is None else set(delivered_block_ids)
+        self._excluded = set(exclude_block_ids or ())
+        self._include_other = include_other
         self.avg_weight = client_model.avg_weight
         self.model_index = client_model.model_index
         self.model_config = client_model.model_config
@@ -155,9 +177,13 @@ class ShardedUpdate:
         for key in full:
             parts = key.split(".")
             if parts[0] != "blocks":
+                if self._include_other:
+                    kept[key] = full[key]
                 continue
             supernet_block = self.model_index["blocks"][int(parts[1])]
-            if supernet_block in self._units:
+            if supernet_block in self._excluded:
+                continue
+            if self._units is None or supernet_block in self._units:
                 kept[key] = full[key]
         return kept
 
