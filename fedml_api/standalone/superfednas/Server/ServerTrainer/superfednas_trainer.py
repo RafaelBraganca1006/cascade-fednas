@@ -190,6 +190,17 @@ class FLOFA_Trainer(ABC):
                 tier_id: -1 for tier_id in self.args.diverse_subnets
             }
             self.sampler_args["tier_debt"] = self._tier_last_round
+            # Per-(client, tier) debt table (DIRECTION §3.2, added 2026-07-26
+            # after the non-IID pilot found debt_by_tier's aggregate staleness
+            # is data-blind: it can't tell a policy WHICH client refreshed a
+            # tier, only WHEN. {client_idx: {tier_id: last_round}}. Only the
+            # bandit consumes this (comm_sim/policies/bandit.py); Lyapunov's
+            # per-tier-only design is left untouched on purpose.
+            self._client_tier_last_round = {
+                client_idx: {tier_id: -1 for tier_id in self.args.diverse_subnets}
+                for client_idx in range(self.args.client_num_in_total)
+            }
+            self.sampler_args["client_tier_debt"] = self._client_tier_last_round
             # Cheap (config, loss) data-utility report (DIRECTION §3.2 /
             # FEEDBACK_REVIEW.md): every client's last local training loss,
             # always available regardless of bandwidth. {client_idx: {config,
@@ -351,17 +362,20 @@ class FLOFA_Trainer(ABC):
                 return tier_id
         return None
 
-    def _mark_tier_debt_served(self, round_num, plan, delivered_tier_idx):
+    def _mark_tier_debt_served(self, round_num, client_idx, plan, delivered_tier_idx):
         """DIRECTION §3.2/§3.3: a delivery reaching plan.tiers[delivered_tier_idx]
         refreshes THAT shell and every smaller one (nested shells are
         cumulative -- S subset M subset L subset XL), regardless of whether
         the delivery was native or cross-context (E3: cross-context is net
         beneficial, still counts as "served"). No-op if the config doesn't
-        match a configured tier."""
+        match a configured tier. Updates both the aggregate (Lyapunov) and
+        per-client (bandit, added 2026-07-26) debt tables from the same loop
+        -- one delivery event, two views of it."""
         for k in range(delivered_tier_idx + 1):
             tier_id = self._tier_id_for_config(plan.tiers[k][1])
             if tier_id is not None:
                 self._tier_last_round[tier_id] = round_num
+                self._client_tier_last_round[client_idx][tier_id] = round_num
 
     @staticmethod
     def _tier_name(subnet_info):
@@ -802,7 +816,7 @@ class FLOFA_Trainer(ABC):
                             and tx_report.delivered_tier is not None
                         ):
                             self._mark_tier_debt_served(
-                                round_num, plan, tx_report.delivered_tier
+                                round_num, client_idx, plan, tx_report.delivered_tier
                             )
                         if (
                             getattr(self.args, "nested_context_ablation", False)

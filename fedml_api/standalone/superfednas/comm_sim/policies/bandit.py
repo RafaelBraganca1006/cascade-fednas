@@ -6,23 +6,46 @@ called anywhere -- and four design hazards addressed before writing this).
 Context (per assign() call, scores all tiers via one shared weight matrix --
 NOT per-client models, too sample-starved at ~8 clients/round): debt per tier
 normalized by (round_num+1) (keeps the staleness FRACTION meaningful
-regardless of run length), log1p(bandwidth_bps/1e6) (log-Mbps), an explicit
-has-bandwidth/has-loss indicator (both can be None), the client's last
+regardless of run length), PLUS client_tier_debt per tier (added 2026-07-26,
+see below), log1p(bandwidth_bps/1e6) (log-Mbps), an explicit has-bandwidth/
+has-loss/has-client-debt indicator (all three can be None), the client's last
 training loss (default = ln(10), the uniform-prior cross-entropy for 10
 classes, when not yet reported), bias term. Raw features span wildly
 different magnitudes (debt ~1-100, bandwidth ~1e6-1e8, loss ~0.01-3) --
 unnormalized, a linear model's dot product would be dominated entirely by
 bandwidth, ignoring debt/loss regardless of true importance.
 
+v2 addition (2026-07-26): client_tier_debt. The non-IID pilot
+(results/README.md) found blind beats BOTH Lyapunov and the v1 bandit --
+debt_by_tier is data-blind by construction, tracking WHEN a tier was served
+but never WHICH client, so a policy built on it re-serves the same
+bandwidth-eligible clients round after round regardless of what classes
+their data holds. Blind's uniform random draw incidentally rotates
+client-tier exposure over 150 rounds; engineered debt doesn't. This adds
+AssignmentContext.client_tier_debt (this client's OWN staleness per tier,
+same round_num+1 normalization) as both a context feature and a reward
+component (below) -- giving the bandit the chance to learn to route
+under-visited clients toward under-visited tiers, not just globally-stale
+ones. Lyapunov is deliberately NOT touched by this change (see base.py) --
+it stays the untouched non-learned baseline.
+
 Reward (computed in update(), observed only for the CHOSEN arm -- standard
-bandit setting): debt[delivered_tier] * bits_delivered / max_tier_payload,
-discounted by (1 - lambda) if the delivery was cross-context. Mirrors
-Lyapunov's objective (same units, normalized so raw bit counts ~1e8 don't
-force an absurdly small learning rate) with one acknowledged simplification:
-lambda discounts the WHOLE cross-context reward rather than isolating the
-penalty to the S shell specifically, since DeliveryFeedback doesn't carry
-shell-level bit granularity -- a deliberate v1 simplification, not an
-oversight (Lyapunov keeps the more precise shell-by-shell accounting).
+bandit setting): (debt[delivered_tier] + client_tier_debt[delivered_tier]) *
+bits_delivered / max_tier_payload, discounted by (1 - lambda) if the
+delivery was cross-context. The additive combination keeps both incentives
+live: a tier that's stale globally still matters (Lyapunov's original
+signal), and now a tier that's specifically stale for THIS client adds
+equally to the reward, rather than being invisible to the objective the way
+a context-only feature would be (adding client_tier_debt to phi alone
+wouldn't align what's REWARDED with what's OBSERVED -- the reward has to
+carry the same signal, or the LMS update has nothing to correlate the new
+feature against). Mirrors Lyapunov's objective (same units, normalized so
+raw bit counts ~1e8 don't force an absurdly small learning rate) with one
+acknowledged simplification: lambda discounts the WHOLE cross-context
+reward rather than isolating the penalty to the S shell specifically, since
+DeliveryFeedback doesn't carry shell-level bit granularity -- a deliberate
+v1 simplification, not an oversight (Lyapunov keeps the more precise
+shell-by-shell accounting).
 
 Update rule: NORMALIZED Widrow-Hoff / LMS online linear regression on the
 chosen arm's weight vector only: w_k += (lr * error / ||phi||^2) * phi,
@@ -84,13 +107,19 @@ class ContextualBanditPolicy(AssignmentPolicy):
         debt = context.debt_by_tier or {}
         denom = context.round_num + 1
         debt_feats = [debt.get(t.tier_id, 0.0) / denom for t in tiers]
+        has_client_debt = 1.0 if context.client_tier_debt is not None else 0.0
+        client_debt = context.client_tier_debt or {}
+        client_debt_feats = [client_debt.get(t.tier_id, 0.0) / denom for t in tiers]
         bw = context.bw_estimate_bps
         has_bw = 1.0 if bw is not None else 0.0
         bw_feat = math.log1p(bw / 1e6) if bw is not None else 0.0
         loss = context.data_utility.get("loss") if context.data_utility else None
         has_loss = 1.0 if loss is not None else 0.0
         loss_feat = loss if loss is not None else DEFAULT_LOSS
-        return debt_feats + [bw_feat, has_bw, loss_feat, has_loss, 1.0]  # + bias
+        return (
+            debt_feats + client_debt_feats
+            + [bw_feat, has_bw, loss_feat, has_loss, has_client_debt, 1.0]  # + bias
+        )
 
     @staticmethod
     def _dot(w, x):
@@ -123,6 +152,7 @@ class ContextualBanditPolicy(AssignmentPolicy):
         max_payload = tiers[-1].payload_bits
         self._pending[(context.round_num, context.client_idx)] = (
             phi, arm_idx, max_payload, dict(context.debt_by_tier),
+            dict(context.client_tier_debt) if context.client_tier_debt is not None else {},
         )
         return tiers[arm_idx]
 
@@ -130,12 +160,14 @@ class ContextualBanditPolicy(AssignmentPolicy):
         pending = self._pending.pop((feedback.round_num, feedback.client_idx), None)
         if pending is None:
             return  # not policy-decided this round (e.g. forced min/max slot)
-        phi, arm_idx, max_payload, debt_snapshot = pending
+        phi, arm_idx, max_payload, debt_snapshot, client_debt_snapshot = pending
         bits = feedback.native_bits + feedback.cross_context_bits
         if max_payload <= 0 or bits <= 0 or feedback.delivered_tier is None:
             reward = 0.0  # total failure IS a signal: push the predicted score down
         else:
-            raw = debt_snapshot.get(feedback.delivered_tier, 0.0) * bits / max_payload
+            tier_debt = debt_snapshot.get(feedback.delivered_tier, 0.0)
+            client_debt = client_debt_snapshot.get(feedback.delivered_tier, 0.0)
+            raw = (tier_debt + client_debt) * bits / max_payload
             reward = raw if feedback.native_context else raw * (1.0 - self.lam)
 
         w = self._weights[arm_idx]

@@ -226,15 +226,72 @@ def test_bandit_missing_bw_and_loss_default_gracefully():
     ctx = base.AssignmentContext(
         round_num=0, client_idx=0, tier_options=tiers,
         debt_by_tier={"0": 1.0, "1": 1.0, "2": 1.0, "3": 1.0},
-        bw_estimate_bps=None, data_utility=None,
+        bw_estimate_bps=None, data_utility=None, client_tier_debt=None,
     )
     phi = bandit._features(ctx, tiers)
-    # layout: [debt x len(tiers), bw_feat, has_bw, loss_feat, has_loss, bias]
-    assert phi[len(tiers)] == 0.0, "bw_feat should be 0.0 when bandwidth is None"
-    assert phi[len(tiers) + 1] == 0.0, "has_bw should be 0.0 when bandwidth is None"
-    assert phi[len(tiers) + 2] == bandit_mod.DEFAULT_LOSS, "loss_feat should default to ln(10)"
-    assert phi[len(tiers) + 3] == 0.0, "has_loss should be 0.0 when data_utility is None"
-    print("PASS bandit features default gracefully with no bandwidth/loss info")
+    # layout: [debt x len(tiers), client_debt x len(tiers), bw_feat, has_bw,
+    #          loss_feat, has_loss, has_client_debt, bias]
+    n = len(tiers)
+    assert phi[n:2 * n] == [0.0] * n, "client_debt_feats should all be 0.0 when None"
+    assert phi[2 * n] == 0.0, "bw_feat should be 0.0 when bandwidth is None"
+    assert phi[2 * n + 1] == 0.0, "has_bw should be 0.0 when bandwidth is None"
+    assert phi[2 * n + 2] == bandit_mod.DEFAULT_LOSS, "loss_feat should default to ln(10)"
+    assert phi[2 * n + 3] == 0.0, "has_loss should be 0.0 when data_utility is None"
+    assert phi[2 * n + 4] == 0.0, "has_client_debt should be 0.0 when client_tier_debt is None"
+    print("PASS bandit features default gracefully with no bandwidth/loss/client-debt info")
+
+
+def test_bandit_client_debt_differentiates_clients():
+    """The 2026-07-26 non-IID fix: two clients with IDENTICAL aggregate
+    debt_by_tier but DIFFERENT client_tier_debt must get different feature
+    vectors and different rewards for the same delivered tier -- otherwise
+    the new field is wired but inert. This is the one thing the whole
+    change is supposed to accomplish."""
+    bandit = policies.ContextualBanditPolicy(lam=0.1, eps0=0.0, eps_min=0.0)
+    tiers = sorted(_fake_tiers(), key=lambda t: t.payload_bits)
+    same_agg_debt = {"0": 5.0, "1": 5.0, "2": 5.0, "3": 5.0}
+
+    ctx_fresh = base.AssignmentContext(
+        round_num=10, client_idx=0, tier_options=tiers, debt_by_tier=same_agg_debt,
+        client_tier_debt={"0": 0.0, "1": 0.0, "2": 0.0, "3": 0.0},  # just served everywhere
+    )
+    ctx_stale = base.AssignmentContext(
+        round_num=10, client_idx=1, tier_options=tiers, debt_by_tier=same_agg_debt,
+        client_tier_debt={"0": 10.0, "1": 10.0, "2": 10.0, "3": 10.0},  # never served
+    )
+    phi_fresh = bandit._features(ctx_fresh, tiers)
+    phi_stale = bandit._features(ctx_stale, tiers)
+    n = len(tiers)
+    assert phi_fresh[:n] == phi_stale[:n], "aggregate debt features should be identical"
+    assert phi_fresh[n:2 * n] != phi_stale[n:2 * n], (
+        "client-debt features must differ when client_tier_debt differs"
+    )
+
+    # Reward must also differ (not just the feature vector) -- same delivered
+    # tier, same bits, only client_tier_debt snapshot differs.
+    bandit.assign(ctx_fresh)
+    bandit.assign(ctx_stale)
+    w_before = [row[:] for row in bandit._weights]
+    fb_fresh = base.DeliveryFeedback(
+        round_num=10, client_idx=0, assigned_tier="3", delivered_tier="3",
+        native_context=True, native_bits=tiers[-1].payload_bits, cross_context_bits=0.0,
+    )
+    bandit.update(fb_fresh)
+    w_after_fresh = [row[:] for row in bandit._weights]
+    bandit._weights = [row[:] for row in w_before]  # reset, isolate the two updates
+    fb_stale = base.DeliveryFeedback(
+        round_num=10, client_idx=1, assigned_tier="3", delivered_tier="3",
+        native_context=True, native_bits=tiers[-1].payload_bits, cross_context_bits=0.0,
+    )
+    bandit.update(fb_stale)
+    w_after_stale = bandit._weights
+    assert w_after_fresh != w_after_stale, (
+        "identical aggregate debt + identical delivery must still produce a "
+        "different weight update when client_tier_debt differs -- otherwise "
+        "the new reward term isn't actually doing anything"
+    )
+    print("PASS bandit's client_tier_debt differentiates clients with identical "
+          "aggregate debt, in both features and reward")
 
 
 def _fake_debt(rng, tier_ids=("0", "1", "2", "3")):
@@ -352,4 +409,5 @@ if __name__ == "__main__":
     test_bandit_weights_move_toward_observed_reward()
     test_bandit_epsilon_decays()
     test_bandit_missing_bw_and_loss_default_gracefully()
+    test_bandit_client_debt_differentiates_clients()
     print("ALL PASS")

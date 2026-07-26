@@ -43,9 +43,21 @@ class AssignmentContext:
         bits/sec, or None if unavailable.
     upload_window_s: seconds available for upload this round.
     debt_by_tier: {tier_id: staleness/debt Q(t)} for the shells this tier
-        would touch -- None until the assignment-level debt table exists
-        (only the shard-level `_unit_last_round` exists today; extending
-        it to tier granularity is Lyapunov's job, not greedy's).
+        would touch -- aggregated over ALL clients (Lyapunov's queue: "how
+        long since ANYONE refreshed this tier"). None until the assignment-
+        level debt table exists.
+    client_tier_debt: {tier_id: staleness of THIS client at this tier --
+        "how long since THIS client specifically refreshed this tier"}.
+        Added 2026-07-26 after the non-IID pilot (results/README.md) found
+        blind beats both Lyapunov and the bandit there: debt_by_tier is
+        data-blind by construction (tracks WHEN a tier was served, never
+        WHICH client), and under non-IID that hides which classes a tier's
+        recent contributions actually represent -- blind's uniform random
+        draw incidentally rotates client-tier exposure, engineered debt
+        doesn't. This field lets a policy target that directly instead of
+        by accident. Only the bandit consumes it (see bandit.py); Lyapunov
+        is deliberately left untouched -- it's the honest non-learned
+        baseline, not a target for iteration. None if not wired.
     data_utility: the client's last self-reported (config, loss), or None.
     """
 
@@ -55,6 +67,7 @@ class AssignmentContext:
     bw_estimate_bps: Optional[float] = None
     upload_window_s: Optional[float] = None
     debt_by_tier: Optional[Dict[str, float]] = None
+    client_tier_debt: Optional[Dict[str, float]] = None
     data_utility: Optional[dict] = None
 
 

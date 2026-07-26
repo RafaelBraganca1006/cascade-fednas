@@ -506,6 +506,15 @@ class BaseServerModel(ABC):
             if tier_debt is not None
             else None
         )
+        client_tier_debt_table = args.get("client_tier_debt")
+        client_tier_debt = (
+            {
+                tid: round_num - last
+                for tid, last in client_tier_debt_table.get(client_idx, {}).items()
+            }
+            if client_tier_debt_table is not None
+            else None
+        )
         data_utility = args.get("data_utility", {}).get(client_idx)
         ctx = AssignmentContext(
             round_num=round_num,
@@ -514,6 +523,7 @@ class BaseServerModel(ABC):
             bw_estimate_bps=bw_estimate,
             upload_window_s=self.cap_deadline,
             debt_by_tier=debt_by_tier,
+            client_tier_debt=client_tier_debt,
             data_utility=data_utility,
         )
         chosen = self._policy.assign(ctx)
