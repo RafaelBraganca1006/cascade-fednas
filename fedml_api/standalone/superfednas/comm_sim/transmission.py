@@ -17,7 +17,7 @@ This module is pure bookkeeping over bit counts and tier configs — no torch �
 so it is unit-testable next to ``selftest_capacity_aware.py``.
 """
 
-TX_MODES = ("all_or_nothing", "nested", "nested_shard")
+TX_MODES = ("all_or_nothing", "nested", "nested_shard", "nested_blocks")
 
 
 def clip_arch_config(arch, tier):
@@ -245,6 +245,156 @@ def truncate(plan, budget_bits, bandwidth_bps, window_s):
         bits_delivered=delivered_bits,
         time_used=min(time_used, float(window_s)),
         completed_plan=completed,
+    )
+
+
+class BlockStreamPlan:
+    """DIRECTION §3.1c -- the unified block-granular stream.
+
+    ONE stream per client. Physical granularity = (shell, block); order = shell
+    order. The deadline cuts anywhere and the server classifies ex-post. This
+    replaces ``TransmissionPlan``'s "a shell is the transmission unit" rule,
+    which is what makes a client whose budget is below the smallest tier deliver
+    NOTHING (measured: 34.8% of participation slots at the E6b config, and the
+    smallest tier is 41.6 MB against a 16.6 MB average budget for those slots).
+    Max waste drops from "one whole shell" to "one cut block".
+
+    **Why the unit is (shell, block) and not just block:** a block appears in
+    several shells at different widths -- narrow in S, gaining channels in M.
+    The transmissible quantity is the block's MARGINAL contribution within a
+    shell, i.e. bits_at_tier_k(b) - bits_at_tier_{k-1}(b). Anything coarser
+    double-counts; anything finer (channel ranges) needs slice arithmetic and
+    risks BN mismatch -- the granularity argument already made in sharding.py.
+
+    units: list of (shell_idx, block_key, bits) in SEND order. Only units with
+        bits > 0 exist, so a block absent from a shallow tier simply has no unit
+        there (depth elasticity is handled for free). block_key is a supernet
+        block id, or the sentinel ``OTHER_BLOCK`` for stem/classifier params.
+    """
+
+    def __init__(self, units, tier_configs):
+        assert len(units) > 0
+        self.units = [(int(s), b, float(n)) for s, b, n in units]
+        self.tier_configs = list(tier_configs)
+        self.num_shells = len(tier_configs)
+        assert all(0 <= s < self.num_shells for s, _, _ in self.units)
+
+    def total_bits(self):
+        return sum(bits for _, _, bits in self.units)
+
+    def shell_bits(self, shell_idx):
+        return sum(b for s, _, b in self.units if s == shell_idx)
+
+
+OTHER_BLOCK = "__other__"  # stem / classifier / anything not under blocks.*
+
+
+class StreamDeliveryReport(DeliveryReport):
+    """What the deadline let through for a block-granular stream.
+
+    Two outcomes coexist for the SAME client, which is the point of the design:
+
+    delivered_tier -- largest k such that EVERY unit of shells 0..k arrived.
+        That prefix is a complete, valid subnet update of tier k and is
+        aggregated by the individual rule, exactly as ``nested`` does today.
+        -1 when even shell 0 is incomplete.
+    block_levels -- {block_key: highest shell j such that all units (0..j, b)
+        arrived}. Per block, shells are nested in width, so a block that got
+        further than the global tier can still be uploaded whole at ITS width
+        and aggregated by the collective rule (a plain key filter, no channel
+        slicing -- same reasoning as ShardedUpdate).
+    leftover_blocks -- {block_key: level} restricted to level > delivered_tier,
+        i.e. exactly the blocks that outran the global prefix. Empty when the
+        cut lands cleanly on a shell boundary.
+    """
+
+    def __init__(self, delivered_tier, delivered_config, bits_attempted,
+                 bits_delivered, time_used, completed_plan, block_levels,
+                 leftover_blocks):
+        super().__init__(delivered_tier, delivered_config, bits_attempted,
+                         bits_delivered, time_used, completed_plan)
+        self.block_levels = block_levels
+        self.leftover_blocks = leftover_blocks
+
+    def delivers_nothing(self):
+        """Unlike the shell path, a stream client that completed no tier may
+        STILL have delivered usable whole blocks -- that is the entire reason
+        this mode exists, so 'nothing' has to mean both are empty."""
+        return self.delivered_tier < 0 and not self.leftover_blocks
+
+
+def truncate_stream(plan, budget_bits, bandwidth_bps, window_s):
+    """Cut a BlockStreamPlan at the upload budget and classify ex-post.
+
+    Whole units only; a half-sent unit is wire waste (one block, not one shell).
+    Walks ``plan.units`` in order and stops at the first unit that does not fit
+    -- the stream is sequential, so a later unit cannot 'jump' a stalled one.
+    """
+    remaining = max(float(budget_bits), 0.0)
+    attempted = 0.0
+    arrived = []
+    for shell, block, bits in plan.units:
+        if bits <= remaining:
+            arrived.append((shell, block))
+            attempted += bits
+            remaining -= bits
+        else:
+            attempted += remaining  # crossed the wire, unusable
+            remaining = 0.0
+            break
+
+    arrived_set = set(arrived)
+    total_units = len(plan.units)
+
+    # global prefix: largest k with every unit of shells 0..k present
+    by_shell = {}
+    for shell, block, _ in plan.units:
+        by_shell.setdefault(shell, set()).add(block)
+    delivered_tier = -1
+    for k in sorted(by_shell):
+        if k != delivered_tier + 1:
+            break  # a shell with no units at all breaks the prefix
+        if all((k, b) in arrived_set for b in by_shell[k]):
+            delivered_tier = k
+        else:
+            break
+
+    # Per-block level: how far up ITS OWN shell sequence each block got before
+    # the first gap. A block's shells are nested in width, so shells 0..j all
+    # arriving means the block is complete at tier j's width and can be shipped
+    # whole -- which is what makes the collective rule a plain key filter.
+    # A block may be absent from shallow tiers (depth elasticity), so we walk
+    # the block's own sorted shell list, not the global 0..K range.
+    shells_of = {}
+    for shell, block, _ in plan.units:
+        shells_of.setdefault(block, []).append(shell)
+    block_levels = {}
+    for block, shells in shells_of.items():
+        level = -1
+        for s in sorted(shells):
+            if (s, block) not in arrived_set:
+                break
+            level = s
+        block_levels[block] = level
+    leftover = {b: lv for b, lv in block_levels.items() if lv > delivered_tier}
+
+    delivered_bits = sum(
+        bits for s, b, bits in plan.units
+        if s <= delivered_tier or (b in leftover and s <= leftover[b])
+    )
+    delivered_config = (
+        plan.tier_configs[delivered_tier] if delivered_tier >= 0 else None
+    )
+    time_used = attempted / bandwidth_bps if bandwidth_bps > 0 else float(window_s)
+    return StreamDeliveryReport(
+        delivered_tier=delivered_tier,
+        delivered_config=delivered_config,
+        bits_attempted=attempted,
+        bits_delivered=delivered_bits,
+        time_used=min(time_used, float(window_s)),
+        completed_plan=len(arrived) == total_units,
+        block_levels=block_levels,
+        leftover_blocks=leftover,
     )
 
 

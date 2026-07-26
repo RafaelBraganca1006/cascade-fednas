@@ -79,6 +79,60 @@ def client_block_bits(client_model, bytes_per_param=4):
     return bits
 
 
+def per_block_bits_of_config(client_model, bytes_per_param=4):
+    """{supernet_block_id (or OTHER_BLOCK): payload bits} for ONE subnet.
+
+    Like client_block_bits, but ALSO accounts for stem/classifier parameters
+    under the OTHER_BLOCK sentinel, so the per-block totals sum exactly to the
+    subnet's payload. The block stream needs that exactness -- if the units
+    don't sum to the payload, the byte accounting diverges from the shell path
+    and the two transmission modes stop being comparable.
+    """
+    from .transmission import OTHER_BLOCK
+
+    bits = {}
+    for key, tensor in client_model.state_dict().items():
+        parts = key.split(".")
+        if parts[0] == "blocks":
+            unit = client_model.model_index["blocks"][int(parts[1])]
+        else:
+            unit = OTHER_BLOCK
+        bits[unit] = bits.get(unit, 0) + tensor.numel() * bytes_per_param * 8
+    return bits
+
+
+def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
+                       block_order=None):
+    """Build the (shell, block) unit stream for one client (DIRECTION §3.1c).
+
+    tier_models: the client's arch clipped by each ladder tier, ascending --
+        i.e. exactly what build_clipped_plan produces, materialised as models.
+    block_order: optional {shell_idx: [block ids in send order]}. Within a
+        shell the blocks are INDEPENDENT (no prefix semantics), so the order is
+        free and is the policy layer's hook. Defaults to sorted block id.
+
+    Unit bits are MARGINAL: bits_at_tier_k(b) - bits_at_tier_{k-1}(b). Units
+    with zero or negative marginal (a block that stopped growing, or is absent
+    at this tier) are dropped, so the stream contains exactly the bits the
+    client would have sent under the shell path -- verified by a self-test.
+    """
+    from .transmission import BlockStreamPlan
+
+    per_tier = [per_block_bits_of_config(m, bytes_per_param) for m in tier_models]
+    units = []
+    for k, cur in enumerate(per_tier):
+        prev = per_tier[k - 1] if k > 0 else {}
+        marginal = {
+            b: cur[b] - prev.get(b, 0) for b in cur if cur[b] - prev.get(b, 0) > 0
+        }
+        order = (block_order or {}).get(k)
+        keys = order if order is not None else sorted(marginal, key=str)
+        for b in keys:
+            if b in marginal:
+                units.append((k, b, marginal[b]))
+    return BlockStreamPlan(units, tier_configs)
+
+
 class ShardedUpdate:
     """Aggregation view of a trained XL update restricted to delivered units.
 
