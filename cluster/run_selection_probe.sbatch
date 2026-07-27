@@ -54,6 +54,9 @@
 #   sbatch cluster/run_selection_probe.sbatch coverage          # probe B
 #   sbatch cluster/run_selection_probe.sbatch none 3 1.0        # 3-round smoke
 #   sbatch cluster/run_selection_probe.sbatch none 75 0.0       # corr=0 control
+#   sbatch cluster/run_selection_probe.sbatch none 75 1.0 40 0.5 0.45 nested_blocks
+#     # the block stream (§3.1c) with blind selection -- tests whether the
+#     # mechanism subsumes probe B's +2.0 WITHOUT its inclusion-gap cost
 #
 # Note --bw_estimate lagged: every E5/E6 policy run silently used the parser
 # default (oracle) and still lost to blind (DIRECTION §3.2b fact 5). The probes
@@ -71,12 +74,13 @@ CORR="${3:-1.0}"      # Stage 1 default -- see the note above
 DEADLINE="${4:-40}"
 ALPHA="${5:-0.5}"
 JITTER="${6:-0.45}"
+TXMODE="${7:-nested}"   # nested (frozen reference) | nested_blocks (§3.1c)
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
   SEL_FLAG="--selection_policy $SELECTION"
 fi
-RUN_NAME="e6b_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+RUN_NAME="e6b_${TXMODE}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
@@ -90,7 +94,7 @@ python train.py \
   --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
   --frequency_of_the_test 25 --partition_alpha "$ALPHA" --init_seed 0 \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
-  --comm_sim --bw_deadline "$DEADLINE" --bw_seed 0 --tx_mode nested \
+  --comm_sim --bw_deadline "$DEADLINE" --bw_seed 0 --tx_mode "$TXMODE" \
   --bw_profile tiered_continuous --bw_jitter_sigma "$JITTER" --bw_data_corr "$CORR" \
   --bw_estimate lagged --maxnet_delivery_aware \
   $SEL_FLAG \
