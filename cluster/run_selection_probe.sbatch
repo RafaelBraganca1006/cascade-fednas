@@ -74,13 +74,34 @@ CORR="${3:-1.0}"      # Stage 1 default -- see the note above
 DEADLINE="${4:-40}"
 ALPHA="${5:-0.5}"
 JITTER="${6:-0.45}"
-TXMODE="${7:-nested}"   # nested (frozen reference) | nested_blocks (§3.1c)
+TXMODE="${7:-nested}"   # nested (frozen reference) | nested_blocks (§3.1c) | all_or_nothing | none
+# MAXNETFIX: on by default, but the VANILLA arm must run without it -- it is our
+# addition (DIRECTION §3.3), not SuperFedNAS's. It is provably INERT under
+# all_or_nothing anyway (delivery_completeness is only assigned in the nested /
+# nested_blocks branches, so the `< 1.0` guard never fires), so switching it off
+# there changes no number and removes the question "why does the baseline carry a
+# flag you invented?". Same for --bw_estimate, which is only read by the
+# capacity_aware / policy_assign samplers and is inert under TS_all_random.
+MAXNETFIX="${8:-on}"
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
   SEL_FLAG="--selection_policy $SELECTION"
 fi
-RUN_NAME="e6b_${TXMODE}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+# tx_mode "none" = the no-communication ceiling: --comm_sim omitted entirely, so
+# nothing is ever dropped or truncated. It is the upper bound the mechanism is
+# measured against ("dynamic bandwidth costs vanilla X points; we recover Y%").
+if [ "$TXMODE" = "none" ]; then
+  COMM_FLAGS=""
+else
+  COMM_FLAGS="--comm_sim --bw_deadline $DEADLINE --bw_seed 0 --tx_mode $TXMODE"
+  COMM_FLAGS="$COMM_FLAGS --bw_profile tiered_continuous --bw_jitter_sigma $JITTER"
+  COMM_FLAGS="$COMM_FLAGS --bw_data_corr $CORR --bw_estimate lagged"
+  if [ "$MAXNETFIX" = "on" ]; then
+    COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
+  fi
+fi
+RUN_NAME="e6b_${TXMODE}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
@@ -94,9 +115,7 @@ python train.py \
   --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
   --frequency_of_the_test 25 --partition_alpha "$ALPHA" --init_seed 0 \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
-  --comm_sim --bw_deadline "$DEADLINE" --bw_seed 0 --tx_mode "$TXMODE" \
-  --bw_profile tiered_continuous --bw_jitter_sigma "$JITTER" --bw_data_corr "$CORR" \
-  --bw_estimate lagged --maxnet_delivery_aware \
+  $COMM_FLAGS \
   $SEL_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
 
