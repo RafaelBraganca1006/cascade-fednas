@@ -1412,6 +1412,21 @@ class FLOFA_Trainer(ABC):
         # Multiply weight with dataset size proportion to global dataset size
         # (len(w_locals) may be < client_num_per_round once comm_sim drops updates)
         if self.args.weight_dataset:
+            # w_locals[idx] and training_samples[idx] are positionally paired.
+            # That pairing HOLDS on every path where one client contributes at
+            # most one entry, but the block stream (DIRECTION §3.1c) emits up to
+            # TWO disjoint updates for the same client -- the tier prefix plus
+            # the blocks that outran it -- so the lists desynchronise and the
+            # tail either mis-weights or raises IndexError. Latent today because
+            # --weight_dataset is off by default and no run passes it; guarded
+            # rather than left as a trap for whoever turns it on.
+            if len(w_locals) != len(training_samples):
+                raise RuntimeError(
+                    "--weight_dataset assumes one aggregation entry per trained "
+                    "client (%d entries vs %d trained). --tx_mode nested_blocks "
+                    "breaks that assumption; pair the samples per entry before "
+                    "enabling it." % (len(w_locals), len(training_samples))
+                )
             total_training_samples = sum(training_samples)
             for idx in range(len(w_locals)):
                 w_locals[idx].set_avg_wt(
