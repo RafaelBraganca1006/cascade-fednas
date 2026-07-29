@@ -142,6 +142,33 @@ def test_depth_elastic_blocks():
     print("PASS depth-elastic blocks (absent from shallow tiers) handled")
 
 
+def test_mixed_block_id_types():
+    """Block ids are ints EXCEPT the OTHER_BLOCK sentinel (stem/classifier), so
+    every collection of them must survive sorting/serialisation.
+
+    Added after job 103854 crashed on `sorted(leftover_blocks.items())` with
+    "'<' not supported between instances of 'str' and 'int'". The earlier tests
+    all used integer ids only, so the mixed case was never exercised -- and
+    fixed order happened to place OTHER_BLOCK last in its shell, hiding it until
+    --block_order random made it likely. Anything that orders block ids must use
+    key=str.
+    """
+    units = []
+    for k, mb in enumerate(SHELL_MB):
+        for b in [0, 1, tx.OTHER_BLOCK, 2]:
+            units.append((k, b, mb * MB / 4))
+    p = tx.BlockStreamPlan(units, CFGS)
+    for budget_mb in [20, 45, 70, 110, 150, 200, 260]:
+        r = tx.truncate_stream(p, budget_mb * MB, 1e9, 40.0)
+        # the exact call that crashed in production
+        sorted(r.leftover_blocks.items(), key=lambda kv: str(kv[0]))
+        sorted(r.block_levels.items(), key=lambda kv: str(kv[0]))
+        assert all(lv > r.delivered_tier for lv in r.leftover_blocks.values())
+    seen = {b for _, b, _ in p.units}
+    assert tx.OTHER_BLOCK in seen and 0 in seen, seen
+    print("PASS mixed int / OTHER_BLOCK ids sort and classify without crashing")
+
+
 def test_zero_budget():
     r = tx.truncate_stream(stream(4), 0.0, 1e9, 40.0)
     assert r.delivered_tier == -1 and r.delivers_nothing()
@@ -156,5 +183,6 @@ if __name__ == "__main__":
     test_waste_is_at_most_one_block()
     test_leftovers_only_above_the_prefix()
     test_depth_elastic_blocks()
+    test_mixed_block_id_types()
     test_zero_budget()
     print("ALL PASS")

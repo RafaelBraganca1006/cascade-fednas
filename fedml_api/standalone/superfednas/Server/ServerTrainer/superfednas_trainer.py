@@ -1380,7 +1380,15 @@ class FLOFA_Trainer(ABC):
                         "leftover blocks %s"
                         % (client_idx, tx_report.delivered_tier,
                            len(tx_report.leftover_blocks),
-                           sorted(tx_report.leftover_blocks.items())[:6])
+                           # key=str: block ids are ints EXCEPT the OTHER_BLOCK
+                           # sentinel (stem/classifier), so a bare sort compares
+                           # str with int and raises. Latent since the stream
+                           # landed -- fixed order happens to place OTHER_BLOCK
+                           # last in its shell, so it rarely survived into
+                           # leftovers; random order made it likely and it
+                           # crashed job 103854 immediately.
+                           sorted(tx_report.leftover_blocks.items(),
+                                  key=lambda kv: str(kv[0]))[:6])
                     )
                 continue
             # nested transmission: the deadline delivered only tier β ⊂ α —
