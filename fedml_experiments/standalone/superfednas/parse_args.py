@@ -731,6 +731,19 @@ def add_args(parser):
         "checkpoint (class x method heatmap data, E4).",
     )
     parser.add_argument(
+        "--block_order",
+        type=str,
+        default="fixed",
+        choices=["fixed", "random"],
+        help="Within-shell send order for --tx_mode nested_blocks. 'fixed' "
+        "(default) sends blocks by index, which the mechanism turns into a "
+        "SYSTEMATIC bias: the deadline always cuts the same high-index blocks "
+        "of every shell, so they are chronically under-trained. 'random' "
+        "reshuffles per (round, client) -- free, since blocks inside a shell "
+        "are independent -- and measures what that bias is worth before a "
+        "learned ordering policy is built on top (DIRECTION 3.2c).",
+    )
+    parser.add_argument(
         "--log_inclusion_gap",
         action="store_true",
         help="Log the accuracy gap between the worst- and best-connectivity "

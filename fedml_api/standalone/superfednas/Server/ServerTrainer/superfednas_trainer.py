@@ -474,9 +474,14 @@ class FLOFA_Trainer(ABC):
             for tier in self._tier_ladder_configs()
         ]
         models = [self.server_model.get_subnet(**cfg) for cfg in clipped]
+        rng = None
+        if getattr(self.args, "block_order", "fixed") == "random":
+            import random as _random
+            # seeded per (round, client) so the run stays reproducible
+            rng = _random.Random((self._cur_round_num, self._cur_client_idx))
         return build_block_stream(
             models, clipped, bytes_per_param=self.comm_sim.bytes_per_param,
-            block_order=block_order,
+            block_order=block_order, rng=rng,
         )
 
     def _stream_updates(self, trained_model, report, plan):
@@ -1082,6 +1087,7 @@ class FLOFA_Trainer(ABC):
                     # budget is below the smallest tier still contributes whole
                     # blocks -- the 34.8%-of-slots-deliver-nothing problem.
                     is_max = self.server_model.is_max_net(client_model.model_config)
+                    self._cur_round_num, self._cur_client_idx = round_num, int(client_idx)
                     stream_plan = self._build_block_stream(client_model.model_config)
                     tx_report = self.comm_sim.transmit_stream(
                         round_num, client_idx, stream_plan, is_max

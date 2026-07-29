@@ -102,7 +102,7 @@ def per_block_bits_of_config(client_model, bytes_per_param=4):
 
 
 def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
-                       block_order=None):
+                       block_order=None, rng=None):
     """Build the (shell, block) unit stream for one client (DIRECTION §3.1c).
 
     tier_models: the client's arch clipped by each ladder tier, ascending --
@@ -126,7 +126,19 @@ def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
             b: cur[b] - prev.get(b, 0) for b in cur if cur[b] - prev.get(b, 0) > 0
         }
         order = (block_order or {}).get(k)
-        keys = order if order is not None else sorted(marginal, key=str)
+        if order is not None:
+            keys = order
+        elif rng is not None:
+            # Randomised within-shell order. The DEFAULT (sorted by block id) has
+            # a systematic bias the mechanism itself creates: the deadline always
+            # cuts the same high-index blocks of every shell, so they are
+            # chronically under-trained. Shuffling costs nothing (blocks inside a
+            # shell are independent -- no prefix semantics) and measures what that
+            # bias is worth before a learned ordering policy is built on top.
+            keys = sorted(marginal, key=str)
+            rng.shuffle(keys)
+        else:
+            keys = sorted(marginal, key=str)
         for b in keys:
             if b in marginal:
                 units.append((k, b, marginal[b]))

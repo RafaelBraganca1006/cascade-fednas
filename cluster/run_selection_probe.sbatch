@@ -83,6 +83,7 @@ TXMODE="${7:-nested}"   # nested (frozen reference) | nested_blocks (§3.1c) | a
 # flag you invented?". Same for --bw_estimate, which is only read by the
 # capacity_aware / policy_assign samplers and is inert under TS_all_random.
 MAXNETFIX="${8:-on}"
+BLOCKORDER="${9:-fixed}"   # fixed | random -- within-shell send order (nested_blocks only)
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
@@ -101,7 +102,7 @@ else
     COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
   fi
 fi
-RUN_NAME="e6b_${TXMODE}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+RUN_NAME="e6b_${TXMODE}_ord${BLOCKORDER}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
@@ -115,6 +116,7 @@ python train.py \
   --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
   --frequency_of_the_test 25 --partition_alpha "$ALPHA" --init_seed 0 \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
+  --block_order "$BLOCKORDER" \
   $COMM_FLAGS \
   $SEL_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
