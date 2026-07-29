@@ -478,7 +478,7 @@ class FLOFA_Trainer(ABC):
         if getattr(self.args, "block_order", "fixed") == "random":
             import random as _random
             # seeded per (round, client) so the run stays reproducible
-            rng = _random.Random((self._cur_round_num, self._cur_client_idx))
+            rng = _random.Random("%d-%d" % (self._cur_round_num, self._cur_client_idx))
         return build_block_stream(
             models, clipped, bytes_per_param=self.comm_sim.bytes_per_param,
             block_order=block_order, rng=rng,
