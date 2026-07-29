@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=e6b_%j.out
@@ -57,6 +57,16 @@
 #   sbatch cluster/run_selection_probe.sbatch none 75 1.0 40 0.5 0.45 nested_blocks
 #     # the block stream (§3.1c) with blind selection -- tests whether the
 #     # mechanism subsumes probe B's +2.0 WITHOUT its inclusion-gap cost
+#
+# WALLTIME (raised to 24h, 2026-07-29): the `jobs` partition allows 7 days; the
+# 12h here was self-imposed. Long-horizon runs need the headroom -- at ~3.3
+# min/round for nested_blocks, 200 rounds is ~11h, uncomfortably close to 12h.
+# Why 200 rounds matters (DIRECTION §3.3b): our weighted_avg_schedule decays
+# MaxNet's beta over num_steps=120, so a 75-round pilot never leaves the warm-up
+# phase -- beta is still ~0.36 at round 75 and the max-slot client still takes
+# ~36% of the aggregate. 200 rounds clears the decay with 80 rounds to spare.
+# It still does NOT match the SuperFedNAS paper's R=1000/1500/2000, so the honest
+# phrasing is "after beta's decay completes", never "at full training".
 #
 # Note --bw_estimate lagged: every E5/E6 policy run silently used the parser
 # default (oracle) and still lost to blind (DIRECTION §3.2b fact 5). The probes
