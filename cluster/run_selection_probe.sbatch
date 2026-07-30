@@ -62,7 +62,11 @@
 #     # 5 rounds. Replaces e6b_103896, whose numbers carry the bug.
 #
 # ARGS: <SELECTION> [ROUNDS] [CORR] [DEADLINE] [ALPHA] [JITTER] [TXMODE] [MAXNETFIX]
-#       [BLOCKORDER] [EVALFREQ]
+#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT]
+#
+#   sbatch cluster/run_selection_probe.sbatch none 200 0.0 40 0.5 0.45 nested_blocks on fixed 10 1
+#     # cohort-complementary streaming (DIRECTION 3.1d) vs the shell-major
+#     # control at the same config -- decided by [shell_cov] s3
 #
 # WALLTIME (raised to 24h, 2026-07-29): the `jobs` partition allows 7 days; the
 # 12h here was self-imposed. Long-horizon runs need the headroom -- at ~3.3
@@ -108,6 +112,12 @@ BLOCKORDER="${9:-fixed}"   # fixed | random -- within-shell send order (nested_b
 # dip. The converged-phase mean over the last evals says +4.2 / +4.8 points.
 # 5 is cheap next to training and makes time-to-accuracy falsifiable.
 EVALFREQ="${10:-5}"
+# Cohort-complementary streaming (DIRECTION 3.1d). -1 = off, today's shell-major
+# stream. 1 = keep the shared core shell-major, complement everything above it:
+# clients in the same round start their block-major tail at different blocks, so
+# the cohort covers the top shell none of them can upload alone. nested_blocks
+# only -- inert in every other tx_mode.
+PIVOT="${11:--1}"
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
@@ -126,7 +136,7 @@ else
     COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
   fi
 fi
-RUN_NAME="e6b_${TXMODE}_ord${BLOCKORDER}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+RUN_NAME="e6b_${TXMODE}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
@@ -140,7 +150,7 @@ python train.py \
   --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
   --frequency_of_the_test "$EVALFREQ" --partition_alpha "$ALPHA" --init_seed 0 \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
-  --block_order "$BLOCKORDER" \
+  --block_order "$BLOCKORDER" --stream_pivot "$PIVOT" \
   $COMM_FLAGS \
   $SEL_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
