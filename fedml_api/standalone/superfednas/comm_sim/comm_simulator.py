@@ -91,7 +91,24 @@ class CommSimulator:
             "incomplete": 0,  # uploads the deadline cut short (drop or truncation)
             "delivered_tiers": [],  # per transmit_plan client: delivered tier index
             "units_delivered": 0,  # shard units delivered by carriers this round
+            # Per-shell unit coverage, comparable across tx_modes (DIRECTION
+            # §3.3b). The question it exists to answer: is the TOP shell -- the
+            # XL-exclusive region, on which the whole Pareto spread depends --
+            # ever refreshed? Nothing else logged can say. The shell path
+            # delivers a shell all-or-nothing, so its counts are 0 or the full
+            # shell; the stream path can deliver a shell partially, which is
+            # exactly the difference the two modes are being compared on.
+            "shell_arrived": {},
+            "shell_total": {},
         }
+
+    def _record_shell_coverage(self, arrived, total):
+        for shell, n in total.items():
+            self._cur["shell_total"][shell] = self._cur["shell_total"].get(shell, 0) + n
+        for shell, n in arrived.items():
+            self._cur["shell_arrived"][shell] = (
+                self._cur["shell_arrived"].get(shell, 0) + n
+            )
 
     def _record(self, client_idx, is_max_net, payload_bits, report):
         """Fold one client's DeliveryReport into the round accumulators."""
@@ -145,6 +162,18 @@ class CommSimulator:
         report = truncate(plan, budget, bw, self.upload_window(client_idx))
         self._record(client_idx, is_max_net, plan.total_bits(), report)
         self._cur["delivered_tiers"].append(report.delivered_tier)
+        # Shell path: a shell arrives whole or not at all, so coverage is a step
+        # function of delivered_tier. Counted in the same units as the stream
+        # path (one "unit" = one shell here) so the two modes are comparable on
+        # the fraction-of-top-shell axis.
+        # Only shells up to train_tier are ever in this client's stream, so the
+        # denominator is train_tier + 1 -- counting shells the client was never
+        # asked to send would understate coverage for every non-XL client.
+        n_shells = plan.train_tier + 1
+        self._record_shell_coverage(
+            {s: 1 for s in range(n_shells) if s <= report.delivered_tier},
+            {s: 1 for s in range(n_shells)},
+        )
         return report
 
     def transmit_stream(self, round_num, client_idx, stream_plan, is_max_net):
@@ -161,6 +190,9 @@ class CommSimulator:
         self._cur["delivered_tiers"].append(report.delivered_tier)
         if report.leftover_blocks:
             self._cur["units_delivered"] += len(report.leftover_blocks)
+        self._record_shell_coverage(
+            report.shell_units_arrived, report.shell_units_total
+        )
         return report
 
     def transmit_shards(self, round_num, client_idx, shard_plan, is_max_net=False):
@@ -217,6 +249,10 @@ class CommSimulator:
             )
         if c["units_delivered"]:
             summary["comm/shard_units_delivered"] = c["units_delivered"]
+        for shell, total in sorted(c["shell_total"].items()):
+            summary["comm/shell_%d_coverage" % shell] = (
+                c["shell_arrived"].get(shell, 0) / max(total, 1)
+            )
         self.round_records.append({**c, "round_time": round_time})
         self._cur = None
         return summary
@@ -227,7 +263,17 @@ class CommSimulator:
         total_dropped = sum(self.per_client_dropped.values())
         max_failed_rounds = sum(1 for r in self.round_records if r["max_failed"])
         max_present_rounds = sum(1 for r in self.round_records if r["max_present"])
+        shell_arrived, shell_total = {}, {}
+        for r in self.round_records:
+            for shell, n in r.get("shell_total", {}).items():
+                shell_total[shell] = shell_total.get(shell, 0) + n
+            for shell, n in r.get("shell_arrived", {}).items():
+                shell_arrived[shell] = shell_arrived.get(shell, 0) + n
         return {
+            "comm/shell_coverage": {
+                s: shell_arrived.get(s, 0) / max(t, 1)
+                for s, t in sorted(shell_total.items())
+            },
             "comm/final_wall_clock_s": self.wall_clock,
             "comm/overall_drop_rate": total_dropped / max(total_selected, 1),
             "comm/max_subnet_failure_rate": max_failed_rounds / max(max_present_rounds, 1),

@@ -57,6 +57,12 @@
 #   sbatch cluster/run_selection_probe.sbatch none 75 1.0 40 0.5 0.45 nested_blocks
 #     # the block stream (§3.1c) with blind selection -- tests whether the
 #     # mechanism subsumes probe B's +2.0 WITHOUT its inclusion-gap cost
+#   sbatch cluster/run_selection_probe.sbatch none 200 0.0 40 0.5 0.45 nested_blocks on fixed 5
+#     # the canonical blocks re-run after the classifier fix (86dbe18), eval every
+#     # 5 rounds. Replaces e6b_103896, whose numbers carry the bug.
+#
+# ARGS: <SELECTION> [ROUNDS] [CORR] [DEADLINE] [ALPHA] [JITTER] [TXMODE] [MAXNETFIX]
+#       [BLOCKORDER] [EVALFREQ]
 #
 # WALLTIME (raised to 24h, 2026-07-29): the `jobs` partition allows 7 days; the
 # 12h here was self-imposed. Long-horizon runs need the headroom -- at ~3.3
@@ -94,6 +100,14 @@ TXMODE="${7:-nested}"   # nested (frozen reference) | nested_blocks (§3.1c) | a
 # capacity_aware / policy_assign samplers and is inert under TS_all_random.
 MAXNETFIX="${8:-on}"
 BLOCKORDER="${9:-fixed}"   # fixed | random -- within-shell send order (nested_blocks only)
+# Eval cadence. Was hardcoded at 25, which gave 9 eval points over a 200-round run
+# -- too coarse to support either headline the curve is supposed to carry
+# ("reaches the baseline's final accuracy 37% earlier", "3x less variance between
+# evals"), and coarse enough to actively mislead: read at round 199 alone the
+# three arms look tied, because 199 caught vanilla at a local peak and ours in a
+# dip. The converged-phase mean over the last evals says +4.2 / +4.8 points.
+# 5 is cheap next to training and makes time-to-accuracy falsifiable.
+EVALFREQ="${10:-5}"
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
@@ -124,7 +138,7 @@ python train.py \
   --subnet_dist_type TS_all_random \
   --diverse_subnets '{"0":{"d":[0,0,0,0],"e":0.1},"1":{"d":[0,1,0,1],"e":0.14},"2":{"d":[1,1,1,1],"e":0.18},"3":{"d":[2,2,2,2],"e":0.25}}' \
   --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
-  --frequency_of_the_test 25 --partition_alpha "$ALPHA" --init_seed 0 \
+  --frequency_of_the_test "$EVALFREQ" --partition_alpha "$ALPHA" --init_seed 0 \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
   --block_order "$BLOCKORDER" \
   $COMM_FLAGS \

@@ -306,15 +306,26 @@ class StreamDeliveryReport(DeliveryReport):
     leftover_blocks -- {block_key: level} restricted to level > delivered_tier,
         i.e. exactly the blocks that outran the global prefix. Empty when the
         cut lands cleanly on a shell boundary.
+    shell_units_arrived / shell_units_total -- {shell: unit count}. Per-shell
+        coverage, needed because none of the other fields can answer "was the
+        XL-exclusive region refreshed at all this round?". delivered_tier says
+        only how far the COMPLETE prefix got; max_subnet_failed says only that
+        the max-slot client did not finish its plan (true in every mode, by
+        construction). The top shell is what the Pareto spread depends on, and
+        the stream sends it LAST, so its arrival rate is the quantity that
+        decides whether a spread can exist at all -- see DIRECTION §3.3b.
     """
 
     def __init__(self, delivered_tier, delivered_config, bits_attempted,
                  bits_delivered, time_used, completed_plan, block_levels,
-                 leftover_blocks):
+                 leftover_blocks, shell_units_arrived=None,
+                 shell_units_total=None):
         super().__init__(delivered_tier, delivered_config, bits_attempted,
                          bits_delivered, time_used, completed_plan)
         self.block_levels = block_levels
         self.leftover_blocks = leftover_blocks
+        self.shell_units_arrived = shell_units_arrived or {}
+        self.shell_units_total = shell_units_total or {}
 
     def delivers_nothing(self):
         """Unlike the shell path, a stream client that completed no tier may
@@ -385,6 +396,12 @@ def truncate_stream(plan, budget_bits, bandwidth_bps, window_s):
     delivered_config = (
         plan.tier_configs[delivered_tier] if delivered_tier >= 0 else None
     )
+    shell_total = {}
+    for shell, _b, _bits in plan.units:
+        shell_total[shell] = shell_total.get(shell, 0) + 1
+    shell_arrived = {s: 0 for s in shell_total}
+    for shell, _b in arrived:
+        shell_arrived[shell] += 1
     time_used = attempted / bandwidth_bps if bandwidth_bps > 0 else float(window_s)
     return StreamDeliveryReport(
         delivered_tier=delivered_tier,
@@ -395,6 +412,8 @@ def truncate_stream(plan, budget_bits, bandwidth_bps, window_s):
         completed_plan=len(arrived) == total_units,
         block_levels=block_levels,
         leftover_blocks=leftover,
+        shell_units_arrived=shell_arrived,
+        shell_units_total=shell_total,
     )
 
 

@@ -1493,6 +1493,26 @@ class FLOFA_Trainer(ABC):
                     capacity_note,
                 )
             )
+            # Per-shell coverage on its own line (DIRECTION §3.3b): the fraction
+            # of each shell's units that arrived this round. shell_3 is the
+            # XL-exclusive region -- if it stays near zero, no Pareto spread can
+            # emerge no matter how many rounds are run, and the missing-spread
+            # diagnosis is a mechanism problem, not a round-budget problem.
+            shell_cov = {
+                int(k.split("_")[1]): v
+                for k, v in comm_summary.items()
+                if k.startswith("comm/shell_") and k.endswith("_coverage")
+            }
+            if shell_cov:
+                logging.info(
+                    "[shell_cov] round %d: %s"
+                    % (
+                        round_num,
+                        " ".join(
+                            "s%d=%.3f" % (s, shell_cov[s]) for s in sorted(shell_cov)
+                        ),
+                    )
+                )
         if policy_tier_counts is not None:
             mean_debt = {
                 tid: round_num - last
