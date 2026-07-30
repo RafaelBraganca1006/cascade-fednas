@@ -459,8 +459,14 @@ class FLOFA_Trainer(ABC):
 
         block_order: {shell_idx: [block ids]} -- the policy layer's hook. Within
         a shell the blocks are independent (no prefix semantics), so reordering
-        them is free; reordering ACROSS shells would trade the valid-subnet
-        guarantee for targeted coverage and is deliberately not exposed yet.
+        them is free.
+
+        Reordering ACROSS shells trades the valid-subnet guarantee for targeted
+        coverage of the starved top region; that is now exposed as
+        --stream_pivot (DIRECTION 3.1d), off by default. The rotation offset is
+        (round + client), so clients in the same round start their block-major
+        tail at different blocks and the cohort covers between them what no
+        single client can upload.
         """
         from fedml_api.standalone.superfednas.comm_sim.sharding import (
             build_block_stream,
@@ -479,9 +485,12 @@ class FLOFA_Trainer(ABC):
             import random as _random
             # seeded per (round, client) so the run stays reproducible
             rng = _random.Random("%d-%d" % (self._cur_round_num, self._cur_client_idx))
+        pivot = getattr(self.args, "stream_pivot", -1)
+        pivot = None if pivot is None or int(pivot) < 0 else int(pivot)
         return build_block_stream(
             models, clipped, bytes_per_param=self.comm_sim.bytes_per_param,
-            block_order=block_order, rng=rng,
+            block_order=block_order, rng=rng, pivot=pivot,
+            rotation_offset=self._cur_round_num + self._cur_client_idx,
         )
 
     def _stream_updates(self, trained_model, report, plan):

@@ -102,7 +102,8 @@ def per_block_bits_of_config(client_model, bytes_per_param=4):
 
 
 def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
-                       block_order=None, rng=None):
+                       block_order=None, rng=None, pivot=None,
+                       rotation_offset=0):
     """Build the (shell, block) unit stream for one client (DIRECTION §3.1c).
 
     tier_models: the client's arch clipped by each ladder tier, ascending --
@@ -115,33 +116,88 @@ def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
     with zero or negative marginal (a block that stopped growing, or is absent
     at this tier) are dropped, so the stream contains exactly the bits the
     client would have sent under the shell path -- verified by a self-test.
+
+    ------------------------------------------------------------------
+    pivot / rotation_offset -- COHORT-COMPLEMENTARY STREAMING (DIRECTION §3.1d)
+    ------------------------------------------------------------------
+    ``pivot=None`` (default) reproduces the shell-major stream exactly, so every
+    archived run stays valid.
+
+    The problem it addresses: shell-major means every client sends its whole
+    shell 0 before any of shell 1, so a round spends most of its bytes on 8
+    copies of the SAME low region -- which the server then averages -- while the
+    top shell, sent last, gets ~27% coverage (analysis/d3_coverage.py). The
+    bytes go where the marginal value is lowest, and the XL-exclusive region
+    that the Pareto front depends on starves.
+
+    ``pivot=p`` splits the stream: shells 0..p-1 stay shell-major (so a client
+    that can afford them still delivers a VALID subnet update via the individual
+    rule, and the stem/classifier under OTHER_BLOCK still arrive), and shells
+    p.. switch to BLOCK-major -- block b at every one of its shells, then block
+    b', and so on. A truncated block-major tail therefore delivers a few blocks
+    COMPLETE at full width instead of many blocks at minimum width, and those go
+    through the collective rule.
+
+    Block-major is what the nesting allows: a block's shells are nested in
+    WIDTH, so its outer channels are meaningless without its inner ones -- you
+    can never skip ahead WITHIN a block, but you can skip ahead ACROSS blocks.
+
+    ``rotation_offset`` rotates which block the tail starts at. Give different
+    clients different offsets (the trainer uses round + client index) and the
+    cohort covers the whole supernet between them, while every client still
+    sends the same number of bytes. Nobody is diverted to carrier duty, which is
+    what made shell sharding lose (DIRECTION §3.1b). Deterministic round-robin,
+    no estimator and nothing learned -- the coverage gain comes from the
+    complementarity itself, not from optimising it.
     """
     from .transmission import BlockStreamPlan
 
     per_tier = [per_block_bits_of_config(m, bytes_per_param) for m in tier_models]
-    units = []
+    marginals = []
     for k, cur in enumerate(per_tier):
         prev = per_tier[k - 1] if k > 0 else {}
-        marginal = {
+        marginals.append({
             b: cur[b] - prev.get(b, 0) for b in cur if cur[b] - prev.get(b, 0) > 0
-        }
+        })
+
+    def shell_keys(k):
         order = (block_order or {}).get(k)
         if order is not None:
-            keys = order
-        elif rng is not None:
+            return [b for b in order if b in marginals[k]]
+        keys = sorted(marginals[k], key=str)
+        if rng is not None:
             # Randomised within-shell order. The DEFAULT (sorted by block id) has
             # a systematic bias the mechanism itself creates: the deadline always
             # cuts the same high-index blocks of every shell, so they are
             # chronically under-trained. Shuffling costs nothing (blocks inside a
             # shell are independent -- no prefix semantics) and measures what that
             # bias is worth before a learned ordering policy is built on top.
-            keys = sorted(marginal, key=str)
             rng.shuffle(keys)
-        else:
-            keys = sorted(marginal, key=str)
-        for b in keys:
-            if b in marginal:
-                units.append((k, b, marginal[b]))
+        return keys
+
+    n_shells = len(marginals)
+    head = n_shells if pivot is None else max(0, min(int(pivot), n_shells))
+
+    units = []
+    for k in range(head):
+        for b in shell_keys(k):
+            units.append((k, b, marginals[k][b]))
+
+    if head < n_shells:
+        # Block-major tail. Visit blocks in a rotated order; for each, emit all
+        # of its remaining shells ascending (width nesting -- never skip within
+        # a block).
+        tail_blocks = sorted(
+            {b for k in range(head, n_shells) for b in marginals[k]}, key=str
+        )
+        if tail_blocks:
+            off = int(rotation_offset) % len(tail_blocks)
+            tail_blocks = tail_blocks[off:] + tail_blocks[:off]
+        for b in tail_blocks:
+            for k in range(head, n_shells):
+                if b in marginals[k]:
+                    units.append((k, b, marginals[k][b]))
+
     return BlockStreamPlan(units, tier_configs)
 
 

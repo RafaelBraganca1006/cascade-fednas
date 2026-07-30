@@ -176,6 +176,121 @@ def test_zero_budget():
     print("PASS zero budget delivers nothing, no crash")
 
 
+# ---------------------------------------------------------------------------
+# Cohort-complementary streaming (DIRECTION 3.1d, --stream_pivot)
+# ---------------------------------------------------------------------------
+
+# sharding.py does `from .transmission import ...`, so it needs a parent
+# package to resolve against. Register a synthetic one holding the already
+# loaded transmission module -- keeps this file torch-free and importable
+# standalone, same as the rest of the self-tests.
+import sys  # noqa: E402
+import types  # noqa: E402
+
+_pkg = types.ModuleType("_commsim")
+_pkg.__path__ = [_here]
+sys.modules["_commsim"] = _pkg
+sys.modules["_commsim.transmission"] = tx
+sh = _load("_commsim.sharding", os.path.join(_here, "sharding.py"))
+
+
+class _Tensor:
+    def __init__(self, n):
+        self._n = n
+
+    def numel(self):
+        return self._n
+
+
+class _StubModel:
+    """Minimal stand-in for a client model: build_block_stream only ever reads
+    state_dict() and model_index, so no torch is needed to test the ORDERING."""
+
+    def __init__(self, n_blocks, per_block_numel, other_numel=8):
+        self._sd = {"stem.weight": _Tensor(other_numel)}
+        for b in range(n_blocks):
+            self._sd["blocks.%d.conv.weight" % b] = _Tensor(per_block_numel)
+        self.model_index = {"blocks": {b: b for b in range(n_blocks)}}
+
+    def state_dict(self):
+        return self._sd
+
+
+def _ladder(n_blocks=4, widths=(2, 4, 6, 12)):
+    """One model per tier; block payload grows with the tier (width nesting)."""
+    return [_StubModel(n_blocks, w) for w in widths], list(CFGS)
+
+
+def test_pivot_default_is_bit_identical():
+    """The load-bearing one: pivot=None must reproduce the shell-major stream
+    EXACTLY, or every archived nested_blocks run stops being comparable."""
+    models, cfgs = _ladder()
+    base = sh.build_block_stream(models, cfgs)
+    for off in (0, 1, 7):
+        same = sh.build_block_stream(models, cfgs, pivot=None, rotation_offset=off)
+        assert same.units == base.units, "pivot=None must ignore rotation_offset"
+    assert sh.build_block_stream(models, cfgs, pivot=4).units == base.units, \
+        "pivot == n_shells is pure shell-major, i.e. the default"
+    print("PASS pivot default (and pivot=n_shells) is bit-identical to shell-major")
+
+
+def test_pivot_preserves_total_bits():
+    """Reordering must never change WHAT is sent, only the order -- otherwise
+    the byte accounting stops being comparable across arms."""
+    models, cfgs = _ladder()
+    base = sh.build_block_stream(models, cfgs)
+    for pivot in (0, 1, 2, 3):
+        for off in (0, 2, 5):
+            p = sh.build_block_stream(
+                models, cfgs, pivot=pivot, rotation_offset=off
+            )
+            assert abs(p.total_bits() - base.total_bits()) < 1e-6
+            assert sorted(p.units, key=str) == sorted(base.units, key=str)
+    print("PASS every pivot/offset is a permutation of the same units")
+
+
+def test_block_major_tail_never_skips_within_a_block():
+    """A block's shells are nested in WIDTH, so its outer channels are useless
+    without its inner ones. The tail may reorder ACROSS blocks, never within."""
+    models, cfgs = _ladder()
+    p = sh.build_block_stream(models, cfgs, pivot=1, rotation_offset=2)
+    seen = {}
+    for k, b, _ in p.units:
+        if k == 0:
+            continue
+        prev = seen.get(b)
+        assert prev is None or k > prev, "shells within a block must ascend"
+        seen[b] = k
+    print("PASS block-major tail keeps each block's shells in ascending order")
+
+
+def test_rotation_makes_the_cohort_cover_the_top():
+    """The point of the mechanism: with a budget that reaches only a fraction
+    of the top shell, shell-major has EVERY client stall in the same place, so
+    the cohort covers nothing new; rotation spreads the stalls and the union
+    covers the top."""
+    models, cfgs = _ladder(n_blocks=4)
+    top = len(cfgs) - 1
+    budget = sh.build_block_stream(models, cfgs).total_bits() * 0.55
+
+    def union_top(pivot, offsets):
+        covered = set()
+        for off in offsets:
+            p = sh.build_block_stream(
+                models, cfgs, pivot=pivot, rotation_offset=off
+            )
+            r = tx.truncate_stream(p, budget, 1e9, 40.0)
+            covered |= {b for b, lv in r.block_levels.items() if lv >= top}
+        return covered
+
+    offsets = [0, 1, 2, 3]
+    shell_major = union_top(None, offsets)
+    rotated = union_top(1, offsets)
+    assert len(rotated) > len(shell_major), (shell_major, rotated)
+    print("PASS rotation lifts the cohort's top-shell coverage %d -> %d blocks"
+          % (len(shell_major), len(rotated)))
+
+
 if __name__ == "__main__":
     test_totals_match_shell_path()
     test_coarse_granularity_reproduces_nested()
@@ -185,4 +300,8 @@ if __name__ == "__main__":
     test_depth_elastic_blocks()
     test_mixed_block_id_types()
     test_zero_budget()
+    test_pivot_default_is_bit_identical()
+    test_pivot_preserves_total_bits()
+    test_block_major_tail_never_skips_within_a_block()
+    test_rotation_makes_the_cohort_cover_the_top()
     print("ALL PASS")

@@ -744,6 +744,26 @@ def add_args(parser):
         "learned ordering policy is built on top (DIRECTION 3.2c).",
     )
     parser.add_argument(
+        "--stream_pivot",
+        type=int,
+        default=-1,
+        help="Cohort-complementary streaming for --tx_mode nested_blocks "
+        "(DIRECTION 3.1d). -1 (default) = OFF, today's pure shell-major stream. "
+        "p >= 0 keeps shells 0..p-1 shell-major (so a client that affords them "
+        "still delivers a valid subnet update, stem/classifier included) and "
+        "switches shells p.. to BLOCK-major: one block complete at full width, "
+        "then the next. Combined with a per-client rotation offset (round + "
+        "client index, applied automatically), different clients cover "
+        "different blocks and the COHORT covers the whole supernet while every "
+        "client still sends the same number of bytes -- nobody is diverted to "
+        "carrier duty, which is what made shell sharding lose. Motivation: "
+        "shell-major spends a round's bytes on 8 copies of the same low region "
+        "while the XL-exclusive top shell, sent last, gets ~27% coverage "
+        "(analysis/d3_coverage.py), i.e. most bytes go where the marginal "
+        "value is lowest. p=1 is the natural setting: guarantee the shared "
+        "core, complement everything above it.",
+    )
+    parser.add_argument(
         "--log_inclusion_gap",
         action="store_true",
         help="Log the accuracy gap between the worst- and best-connectivity "
