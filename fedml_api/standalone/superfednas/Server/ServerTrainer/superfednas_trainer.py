@@ -498,14 +498,30 @@ class FLOFA_Trainer(ABC):
         updates = []
         leftover = report.leftover_blocks
         if report.delivered_tier >= 0:
-            sliced = self._slice_client_update(trained_model, report.delivered_config)
-            if leftover:
-                updates.append(
-                    ShardedUpdate(sliced, None, exclude_block_ids=set(leftover),
-                                  include_other=True)
-                )
-            else:
-                updates.append(sliced)  # identical to the shell path
+            # The prefix is emitted COMPLETE -- every block plus stem/classifier.
+            #
+            # An earlier version excluded the leftover blocks here to keep the
+            # two parts disjoint. That is silently WRONG: add_subnet derives
+            # `classifier_active_in` from the LAST conv2 key it iterates and then
+            # slices the linear layer with it, so removing blocks while keeping
+            # the classifier makes that width come from the wrong block. When the
+            # widths are incompatible it raises (RuntimeError: size of tensor a
+            # (1024) must match tensor b (2048) -- job 103858); when they merely
+            # differ it updates only part of the classifier, with no error at all.
+            # The silent case is the dangerous one and it affected the
+            # fixed-order runs that completed.
+            #
+            # Cost of emitting complete: the leftover blocks' prefix coordinates
+            # are now carried twice (once here, once in the leftover part below),
+            # so this client's INFLUENCE doubles on those coordinates -- same
+            # value, so no corruption, but a real over-weighting on a minority of
+            # coordinates. That is the lesser evil against a wrong or partial
+            # classifier, and it is bounded by the leftover fraction. Removing it
+            # properly needs channel-range slicing, which sharding.py's
+            # granularity argument deliberately rules out.
+            updates.append(self._slice_client_update(
+                trained_model, report.delivered_config
+            ))
         # blocks that got further than the prefix, grouped by the width reached
         by_level = {}
         for block, level in leftover.items():
