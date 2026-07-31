@@ -1306,14 +1306,26 @@ class FLOFA_Trainer(ABC):
                 getattr(self.args, "maxnet_delivery_aware", False)
                 and delivery_completeness < 1.0
             ):
-                # DIRECTION §3.3: a client's MaxNet weight was assigned to its
-                # PRE-round slot, before we knew whether the deadline would
-                # truncate the delivery. Scale it down by how much of the
-                # intended payload actually arrived, instead of applying the
-                # full (possibly slot-max, beta up to 0.9 early in training)
-                # weight to a small truncated slice. Off by default --
-                # comparable to all prior results (v2_arm_b_nested_baseline.out
-                # etc. all ran without this).
+                # DIRECTION 3.3. A client's MaxNet weight is assigned to its
+                # PRE-round SLOT, before anyone knows whether the deadline will
+                # truncate the delivery. Scale it by how much of the intended
+                # payload actually arrived, rather than applying the full
+                # (possibly slot-max, beta up to 0.9 early in training) weight
+                # to a small truncated slice.
+                #
+                # This is NOT a bug fix, and calling it one was withdrawn
+                # 2026-07-31. The unscaled branch does exactly what it says;
+                # vanilla SuperFedNAS simply never reaches this case, because
+                # without truncation the max slot always delivers in full.
+                # Truncation raises a question the base aggregation rule does
+                # not answer -- what weight should a partially delivered
+                # max-slot update carry? -- and keeping the slot weight,
+                # scaling by completeness, and falling back to the non-max
+                # weight are all defensible answers. This one is the
+                # CONSERVATIVE answer: it produces the smaller spread, so the
+                # result it supports cannot be accused of flattering us.
+                # Off by default, so every prior run
+                # (v2_arm_b_nested_baseline.out etc.) stays reproducible.
                 maxnet_weight *= delivery_completeness
             client_model.set_avg_wt(maxnet_weight)
             cur_model_vec = None
