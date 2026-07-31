@@ -341,37 +341,6 @@ def test_rotation_spread_is_even_across_the_cohort():
           % (even, clumped))
 
 
-def _prefix_exclude(leftover):
-    """The rule in superfednas_trainer._stream_updates, extracted so it can be
-    tested without torch. Keep the highest-index leftover block in the prefix
-    (add_subnet reads classifier_active_in off the last conv2 present), exclude
-    every other leftover so it is not counted twice."""
-    ints = [b for b in leftover if isinstance(b, int)]
-    keep = max(ints) if ints else None
-    return [b for b in leftover if b is not keep], keep
-
-
-def test_prefix_excludes_leftovers_except_the_classifier_block():
-    lo = {2: 1, 5: 2, 9: 1}
-    exc, keep = _prefix_exclude(lo)
-    assert keep == 9, keep
-    assert sorted(exc) == [2, 5], exc
-    # the whole point: at most ONE block is ever carried by both parts
-    assert len(lo) - len(exc) == 1
-    print("PASS prefix excludes all leftovers but the classifier block (9)")
-
-
-def test_prefix_exclusion_handles_other_block_and_empty():
-    exc, keep = _prefix_exclude({})
-    assert exc == [] and keep is None
-    # OTHER_BLOCK is not an int and must never be chosen as the classifier
-    # anchor, nor silently dropped from the prefix (it carries stem/classifier)
-    lo = {tx.OTHER_BLOCK: 1, 3: 2}
-    exc, keep = _prefix_exclude(lo)
-    assert keep == 3, keep
-    assert exc == [tx.OTHER_BLOCK], exc
-    print("PASS OTHER_BLOCK never anchors the classifier; empty leftovers safe")
-
 
 def test_sharded_update_exclusion_keeps_stem_and_the_anchor():
     m = _StubModel(n_blocks=4, per_block_numel=6)
@@ -398,7 +367,5 @@ if __name__ == "__main__":
     test_rotation_makes_the_cohort_cover_the_top()
     test_other_block_never_lands_in_the_tail()
     test_rotation_spread_is_even_across_the_cohort()
-    test_prefix_excludes_leftovers_except_the_classifier_block()
-    test_prefix_exclusion_handles_other_block_and_empty()
     test_sharded_update_exclusion_keeps_stem_and_the_anchor()
     print("ALL PASS")

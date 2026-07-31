@@ -527,11 +527,6 @@ class FLOFA_Trainer(ABC):
         # plain blocks and 4.15 under --stream_pivot, i.e. the artifact was
         # LARGER in the arm being tested against the other -- exactly the
         # confound the blocks-vs-rotation comparison cannot afford.
-        keep_for_classifier = None
-        int_leftovers = [b for b in leftover if isinstance(b, int)]
-        if int_leftovers:
-            keep_for_classifier = max(int_leftovers)
-        prefix_exclude = [b for b in leftover if b is not keep_for_classifier]
         if report.delivered_tier >= 0:
             # The prefix keeps stem/classifier and every block EXCEPT the
             # leftovers, minus the one held back above for the classifier width.
@@ -550,6 +545,22 @@ class FLOFA_Trainer(ABC):
             sliced = self._slice_client_update(
                 trained_model, report.delivered_config
             )
+            # The anchor is the LAST block of the PREFIX MODEL, which is what
+            # add_subnet actually iterates -- not the highest-id leftover. A
+            # first version of this fix used the latter and crashed the smoke
+            # (job 104122, "size of tensor a (512) must match b (2048)"): the
+            # prefix is sliced at delivered_tier, so depth elasticity gives it
+            # FEWER blocks than the trained arch, and a leftover that only
+            # exists at higher tiers is not in the prefix at all -- so the max
+            # leftover id could name a block that was never the last one here.
+            present = {
+                int(k.split(".")[1]): None
+                for k in sliced.state_dict() if k.startswith("blocks.")
+            }
+            anchor = (
+                sliced.model_index["blocks"][max(present)] if present else None
+            )
+            prefix_exclude = [b for b in leftover if b != anchor]
             if prefix_exclude:
                 sliced = ShardedUpdate(
                     sliced, None, exclude_block_ids=prefix_exclude,
