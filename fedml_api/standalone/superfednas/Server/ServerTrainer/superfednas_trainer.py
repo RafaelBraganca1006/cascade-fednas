@@ -515,31 +515,47 @@ class FLOFA_Trainer(ABC):
 
         updates = []
         leftover = report.leftover_blocks
+        # Which leftover blocks must stay in the prefix part. add_subnet derives
+        # classifier_active_in from the LAST conv2 key it iterates, i.e. the
+        # highest-index block present -- so that ONE block has to stay or the
+        # classifier is sliced at the wrong width (silently, which is what cost
+        # job 103858 and corrupted the fixed-order runs). Every OTHER leftover
+        # block can be excluded, and must be: the prefix and the leftover part
+        # both carry the full maxnet_weight, so a block in both counts TWICE and
+        # that client's influence doubles on its inner coordinates. Measured
+        # before this fix: 2.46 duplicated blocks per affected delivery under
+        # plain blocks and 4.15 under --stream_pivot, i.e. the artifact was
+        # LARGER in the arm being tested against the other -- exactly the
+        # confound the blocks-vs-rotation comparison cannot afford.
+        keep_for_classifier = None
+        int_leftovers = [b for b in leftover if isinstance(b, int)]
+        if int_leftovers:
+            keep_for_classifier = max(int_leftovers)
+        prefix_exclude = [b for b in leftover if b is not keep_for_classifier]
         if report.delivered_tier >= 0:
-            # The prefix is emitted COMPLETE -- every block plus stem/classifier.
+            # The prefix keeps stem/classifier and every block EXCEPT the
+            # leftovers, minus the one held back above for the classifier width.
             #
-            # An earlier version excluded the leftover blocks here to keep the
-            # two parts disjoint. That is silently WRONG: add_subnet derives
-            # `classifier_active_in` from the LAST conv2 key it iterates and then
-            # slices the linear layer with it, so removing blocks while keeping
-            # the classifier makes that width come from the wrong block. When the
-            # widths are incompatible it raises (RuntimeError: size of tensor a
-            # (1024) must match tensor b (2048) -- job 103858); when they merely
-            # differ it updates only part of the classifier, with no error at all.
-            # The silent case is the dangerous one and it affected the
-            # fixed-order runs that completed.
-            #
-            # Cost of emitting complete: the leftover blocks' prefix coordinates
-            # are now carried twice (once here, once in the leftover part below),
-            # so this client's INFLUENCE doubles on those coordinates -- same
-            # value, so no corruption, but a real over-weighting on a minority of
-            # coordinates. That is the lesser evil against a wrong or partial
-            # classifier, and it is bounded by the leftover fraction. Removing it
-            # properly needs channel-range slicing, which sharding.py's
-            # granularity argument deliberately rules out.
-            updates.append(self._slice_client_update(
+            # History, so the earlier reversal is not repeated: a first version
+            # excluded ALL leftover blocks and was silently wrong -- with the
+            # highest-index block gone, `classifier_active_in` came from the
+            # wrong block, which raises when the widths are incompatible
+            # (RuntimeError 1024 vs 2048, job 103858) and, worse, silently
+            # updates part of the classifier when they merely differ. The fix
+            # then swung to emitting the prefix COMPLETE, which is correct but
+            # double-counts every leftover block. Keeping exactly the one block
+            # the classifier depends on gets both properties: the width is
+            # derived from the same block as before, and at most ONE block is
+            # ever carried twice instead of all of them.
+            sliced = self._slice_client_update(
                 trained_model, report.delivered_config
-            ))
+            )
+            if prefix_exclude:
+                sliced = ShardedUpdate(
+                    sliced, None, exclude_block_ids=prefix_exclude,
+                    include_other=True,
+                )
+            updates.append(sliced)
         # blocks that got further than the prefix, grouped by the width reached
         by_level = {}
         for block, level in leftover.items():
