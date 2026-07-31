@@ -487,10 +487,19 @@ class FLOFA_Trainer(ABC):
             rng = _random.Random("%d-%d" % (self._cur_round_num, self._cur_client_idx))
         pivot = getattr(self.args, "stream_pivot", -1)
         pivot = None if pivot is None or int(pivot) < 0 else int(pivot)
+        # Spread the round's clients evenly over the block space by their RANK
+        # in the round, not by client index: the sampled indices are arbitrary
+        # (e.g. [12, 4, 18, 0, 9, 5, 3, 10]), so index-based offsets clump --
+        # ranks 3/4/5 would start one block apart and cover the same region
+        # while others get nobody, defeating the complementarity the mechanism
+        # exists for. The round number still rotates the whole pattern over time
+        # so no block is permanently last in line.
         return build_block_stream(
             models, clipped, bytes_per_param=self.comm_sim.bytes_per_param,
             block_order=block_order, rng=rng, pivot=pivot,
-            rotation_offset=self._cur_round_num + self._cur_client_idx,
+            rotation_offset=getattr(self, "_cur_round_num", 0),
+            rotation_spread=(getattr(self, "_cur_client_rank", 0),
+                             self.args.client_num_per_round),
         )
 
     def _stream_updates(self, trained_model, report, plan):
@@ -1113,6 +1122,7 @@ class FLOFA_Trainer(ABC):
                     # blocks -- the 34.8%-of-slots-deliver-nothing problem.
                     is_max = self.server_model.is_max_net(client_model.model_config)
                     self._cur_round_num, self._cur_client_idx = round_num, int(client_idx)
+                    self._cur_client_rank = idx  # position in THIS round's cohort
                     stream_plan = self._build_block_stream(client_model.model_config)
                     tx_report = self.comm_sim.transmit_stream(
                         round_num, client_idx, stream_plan, is_max

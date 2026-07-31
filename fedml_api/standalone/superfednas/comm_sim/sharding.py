@@ -103,7 +103,7 @@ def per_block_bits_of_config(client_model, bytes_per_param=4):
 
 def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
                        block_order=None, rng=None, pivot=None,
-                       rotation_offset=0):
+                       rotation_offset=0, rotation_spread=None):
     """Build the (shell, block) unit stream for one client (DIRECTION §3.1c).
 
     tier_models: the client's arch clipped by each ladder tier, ascending --
@@ -142,13 +142,25 @@ def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
     WIDTH, so its outer channels are meaningless without its inner ones -- you
     can never skip ahead WITHIN a block, but you can skip ahead ACROSS blocks.
 
-    ``rotation_offset`` rotates which block the tail starts at. Give different
-    clients different offsets (the trainer uses round + client index) and the
-    cohort covers the whole supernet between them, while every client still
-    sends the same number of bytes. Nobody is diverted to carrier duty, which is
-    what made shell sharding lose (DIRECTION §3.1b). Deterministic round-robin,
-    no estimator and nothing learned -- the coverage gain comes from the
+    ``rotation_offset`` rotates which block the tail starts at, and
+    ``rotation_spread=(rank, k)`` spreads the k clients of a round evenly over
+    the block space: client of rank i starts at ``offset + i*n//k``. Without the
+    spread the trainer's natural choice is the raw client index, and THAT IS
+    WRONG -- a round's selected indices are arbitrary (e.g. [12, 4, 18, 0, 9, 5,
+    3, 10]), so ranks 3/4/5 would start one block apart and cover the same
+    region while other regions get nobody. Even spreading is the whole point:
+    the cohort covers the supernet between them while every client still sends
+    the same number of bytes. Nobody is diverted to carrier duty, which is what
+    made shell sharding lose (DIRECTION §3.1b). Deterministic round-robin, no
+    estimator and nothing learned -- the coverage gain comes from the
     complementarity itself, not from optimising it.
+
+    ``OTHER_BLOCK`` (stem + classifier) is always kept in the HEAD, never in the
+    block-major tail. It is tiny, it is part of a valid subnet, and critically
+    ``ShardedUpdate`` drops non-``blocks`` keys from collective updates
+    (``include_other=False``) -- so an OTHER_BLOCK unit that arrived in the tail
+    would be counted as delivered bytes and then never aggregated, overstating
+    delivery in exactly the number the thesis reports.
     """
     from .transmission import BlockStreamPlan
 
@@ -184,14 +196,26 @@ def build_block_stream(tier_models, tier_configs, bytes_per_param=4,
             units.append((k, b, marginals[k][b]))
 
     if head < n_shells:
+        from .transmission import OTHER_BLOCK
+
+        tail_all = {b for k in range(head, n_shells) for b in marginals[k]}
+        # stem/classifier stay in the head (see docstring): emit their remaining
+        # shells now, so they are never a tail unit the collective rule drops.
+        for k in range(head, n_shells):
+            if OTHER_BLOCK in marginals[k]:
+                units.append((k, OTHER_BLOCK, marginals[k][OTHER_BLOCK]))
         # Block-major tail. Visit blocks in a rotated order; for each, emit all
         # of its remaining shells ascending (width nesting -- never skip within
         # a block).
-        tail_blocks = sorted(
-            {b for k in range(head, n_shells) for b in marginals[k]}, key=str
-        )
+        tail_blocks = sorted(tail_all - {OTHER_BLOCK}, key=str)
         if tail_blocks:
-            off = int(rotation_offset) % len(tail_blocks)
+            n = len(tail_blocks)
+            off = int(rotation_offset)
+            if rotation_spread is not None:
+                rank, k_sel = rotation_spread
+                if k_sel:
+                    off += (int(rank) * n) // int(k_sel)
+            off %= n
             tail_blocks = tail_blocks[off:] + tail_blocks[:off]
         for b in tail_blocks:
             for k in range(head, n_shells):

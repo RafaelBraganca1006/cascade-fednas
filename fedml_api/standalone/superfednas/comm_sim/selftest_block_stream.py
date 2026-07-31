@@ -291,6 +291,54 @@ def test_rotation_makes_the_cohort_cover_the_top():
           % (len(shell_major), len(rotated)))
 
 
+def test_other_block_never_lands_in_the_tail():
+    """stem/classifier must stay in the head: ShardedUpdate drops non-`blocks`
+    keys from collective updates, so an OTHER_BLOCK unit arriving in the tail
+    would be charged as delivered bytes and never aggregated."""
+    models, cfgs = _ladder()
+    # give the stem a marginal at every tier, so it WOULD be a tail unit
+    for i, m in enumerate(models):
+        m._sd["stem.weight"] = _Tensor(4 * (i + 1))
+    p = sh.build_block_stream(models, cfgs, pivot=1, rotation_offset=3)
+    tail_start = max(i for i, (k, _b, _s) in enumerate(p.units) if k == 0) + 1
+    other_pos = [i for i, (_k, b, _s) in enumerate(p.units) if b is tx.OTHER_BLOCK]
+    assert other_pos, "stem should still be in the stream"
+    n_blocks = len({b for _k, b, _s in p.units if b is not tx.OTHER_BLOCK})
+    # every OTHER_BLOCK unit comes before the first real tail block completes
+    first_tail_block = next(b for k, b, _s in p.units[tail_start:]
+                            if b is not tx.OTHER_BLOCK)
+    first_tail_pos = next(i for i, (_k, b, _s) in enumerate(p.units)
+                          if b is first_tail_block and i >= tail_start)
+    assert max(other_pos) < first_tail_pos, (other_pos, first_tail_pos, n_blocks)
+    print("PASS OTHER_BLOCK stays in the head, never a block-major tail unit")
+
+
+def test_rotation_spread_is_even_across_the_cohort():
+    """The offsets of a round's K clients must spread over the block space.
+    Using raw client indices (the natural but wrong choice) clumps them: a
+    sampled set like [12, 4, 18, 0, 9, 5, 3, 10] puts ranks 3/4/5 one block
+    apart, covering the same region while others get none."""
+    models, cfgs = _ladder(n_blocks=8)
+    K = 4
+
+    def first_tail_blocks(spread_offsets):
+        seen = []
+        for off, spread in spread_offsets:
+            p = sh.build_block_stream(models, cfgs, pivot=1,
+                                      rotation_offset=off, rotation_spread=spread)
+            tail = [b for k, b, _s in p.units if k > 0 and b is not tx.OTHER_BLOCK]
+            seen.append(tail[0])
+        return seen
+
+    even = first_tail_blocks([(0, (i, K)) for i in range(K)])
+    clumped = first_tail_blocks([(i, None) for i in (12, 4, 18, 0)])
+    assert len(set(even)) == K, f"rank-spread offsets must be distinct: {even}"
+    gaps = sorted((even[(i + 1) % K] - even[i]) % 8 for i in range(K))
+    assert min(gaps) >= 1, gaps
+    print("PASS cohort offsets spread evenly (%s) vs index-based (%s)"
+          % (even, clumped))
+
+
 if __name__ == "__main__":
     test_totals_match_shell_path()
     test_coarse_granularity_reproduces_nested()
@@ -304,4 +352,6 @@ if __name__ == "__main__":
     test_pivot_preserves_total_bits()
     test_block_major_tail_never_skips_within_a_block()
     test_rotation_makes_the_cohort_cover_the_top()
+    test_other_block_never_lands_in_the_tail()
+    test_rotation_spread_is_even_across_the_cohort()
     print("ALL PASS")
