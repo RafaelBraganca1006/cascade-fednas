@@ -62,7 +62,7 @@
 #     # 5 rounds. Replaces e6b_103896, whose numbers carry the bug.
 #
 # ARGS: <SELECTION> [ROUNDS] [CORR] [DEADLINE] [ALPHA] [JITTER] [TXMODE] [MAXNETFIX]
-#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT]
+#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT] [SAMPLER]
 #
 #   sbatch cluster/run_selection_probe.sbatch none 200 0.0 40 0.5 0.45 nested_blocks on fixed 10 1
 #     # cohort-complementary streaming (DIRECTION 3.1d) vs the shell-major
@@ -118,6 +118,14 @@ EVALFREQ="${10:-5}"
 # the cohort covers the top shell none of them can upload alone. nested_blocks
 # only -- inert in every other tx_mode.
 PIVOT="${11:--1}"
+# Subnet sampler. TS_all_random (default) is the blind baseline every mechanism
+# arm uses. capacity_aware is MaxFit -- assign each client the largest subnet
+# that fits its ESTIMATED budget, the obvious fix to the drops. It is the
+# thesis's motivating counterexample (best mean, front flattened to +0.09 at
+# alpha=100/T=20/uniform), so it has to be re-run at any new profile or the
+# headline table has a hole. It reads --bw_estimate, which is why every arm here
+# passes `lagged`: oracle would be an unfair advantage for MaxFit specifically.
+SAMPLER="${12:-TS_all_random}"
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
@@ -136,7 +144,7 @@ else
     COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
   fi
 fi
-RUN_NAME="e6b_${TXMODE}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+RUN_NAME="e6b_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
@@ -145,7 +153,7 @@ python train.py \
   --model ofaresnet50_32x32_10_26 --partition_method hetero \
   --client_num_in_total 20 --client_num_per_round 8 --comm_round "$ROUNDS" \
   --epochs 5 --batch_size 64 --client_optimizer sgd --lr 0.1 --ci 0 \
-  --subnet_dist_type TS_all_random \
+  --subnet_dist_type "$SAMPLER" \
   --diverse_subnets '{"0":{"d":[0,0,0,0],"e":0.1},"1":{"d":[0,1,0,1],"e":0.14},"2":{"d":[1,1,1,1],"e":0.18},"3":{"d":[2,2,2,2],"e":0.25}}' \
   --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
   --frequency_of_the_test "$EVALFREQ" --partition_alpha "$ALPHA" --init_seed 0 \
