@@ -41,6 +41,18 @@ def add_args(parser):
     parser.add_argument('--gpu_num_per_server', type=int, default=4,
                         help='gpu_num_per_server')
 
+    # --- comm_sim harness (EXPERIMENTS.md E2c) ---------------------------
+    # Same deadline model the SuperFedNAS arms run under, so "the failure mode
+    # belongs to the whole FedNAS family" is measured, not argued. Off by
+    # default: without --comm_sim this file behaves exactly as before.
+    parser.add_argument('--comm_sim', action='store_true',
+                        help='drop updates that miss the round deadline')
+    parser.add_argument('--bw_deadline', type=float, default=20.0,
+                        help='per-round upload budget in seconds')
+    parser.add_argument('--bw_seed', type=int, default=0)
+    parser.add_argument('--bw_jitter_sigma', type=float, default=0.45,
+                        help='within-state spread of tiered_continuous')
+
     parser.add_argument('--stage', type=str, default='search',
                         help='stage: search; train')
     parser.add_argument('--model', type=str, default='resnet', metavar='N',
