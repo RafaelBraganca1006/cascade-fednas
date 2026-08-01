@@ -43,6 +43,7 @@ class FedNASAggregator(object):
         # FedNASServerManager.
         self.comm_sim = None
         self.round_idx = 0
+        self._delivered = None  # set per round by aggregate()
         if getattr(args, "comm_sim", False):
             from fedml_api.standalone.superfednas.comm_sim.comm_simulator import (
                 CommSimulator,
@@ -121,6 +122,8 @@ class FedNASAggregator(object):
         return True
 
     def aggregate(self):
+        # Snapshot who delivered BEFORE __aggregate_weight clears model_dict.
+        self._delivered = sorted(self.model_dict.keys())
         if self.comm_sim is not None:
             summary = self.comm_sim.end_round()
             logging.info(
@@ -159,8 +162,17 @@ class FedNASAggregator(object):
             model_arch.data.copy_(a_g.data)
 
     def delivered_indices(self):
-        """Clients whose update actually arrived this round. Without comm_sim
-        this is every client, so the legacy path is unchanged."""
+        """Clients whose update actually arrived this round.
+
+        Read from the snapshot taken at the top of aggregate(), NOT from
+        model_dict: __aggregate_weight() ends with model_dict.clear(), and
+        __aggregate_alpha() runs after it, so reading model_dict there would
+        yield an empty list and crash on alpha_list[0]. The original code did
+        not have this hazard because it iterated range(client_num) over
+        arch_dict, which is never cleared.
+        """
+        if self._delivered is not None:
+            return self._delivered
         return sorted(self.model_dict.keys())
 
     def __aggregate_weight(self):
