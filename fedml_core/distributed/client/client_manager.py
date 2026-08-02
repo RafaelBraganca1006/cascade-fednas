@@ -3,10 +3,15 @@ from abc import abstractmethod
 import sys
 from mpi4py import MPI
 
-from ..communication.gRPC.grpc_comm_manager import GRPCCommManager
+# gRPC/MQTT are imported LAZILY, inside the branches that use them.
+# Eager imports broke every MPI run: the vendored gRPC manager does
+# `from FedML.fedml_core...`, an absolute import of a package that does
+# not exist in this copy, and its generated _pb2 files predate protobuf
+# 4.x. Neither is reachable under backend=MPI, so paying for them at
+# module import was wrong; a GRPC/MQTT user still gets the import, just
+# at construction time.
 from ..communication.message import Message
 from ..communication.mpi.com_manager import MpiCommunicationManager
-from ..communication.mqtt.mqtt_comm_manager import MqttCommManager
 from ..communication.observer import Observer
 
 
@@ -23,10 +28,12 @@ class ClientManager(Observer):
             HOST = "0.0.0.0"
             # HOST = "broker.emqx.io"
             PORT = 1883
+            from ..communication.mqtt.mqtt_comm_manager import MqttCommManager
             self.com_manager = MqttCommManager(HOST, PORT, client_id=rank, client_num=size - 1)
         elif backend == "GRPC":
             HOST = "0.0.0.0"
             PORT = 50000 + rank
+            from ..communication.gRPC.grpc_comm_manager import GRPCCommManager
             self.com_manager = GRPCCommManager(HOST, PORT, ip_config_path=args.grpc_ipconfig_path, client_id=rank, client_num=size - 1)
         else:
             self.com_manager = MpiCommunicationManager(comm, rank, size, node_type="client")
