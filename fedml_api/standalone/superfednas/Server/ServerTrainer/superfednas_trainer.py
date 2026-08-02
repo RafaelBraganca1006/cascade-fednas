@@ -755,6 +755,15 @@ class FLOFA_Trainer(ABC):
                 for x, y in self.test_global:
                     x, y = x.to(device), y.view(-1).to(device)
                     logits = model(x)
+                    if isinstance(logits, tuple):
+                        # DARTS nets (NetworkCIFAR, the FedNAS baseline) return
+                        # (logits, logits_aux) from the auxiliary head. The
+                        # train and test paths in subnet_trainer.py already
+                        # unwrap this; per-class logging was written before any
+                        # non-supernet model existed here. isinstance rather
+                        # than `args.model == "darts"` so the next model with an
+                        # auxiliary head does not rediscover this.
+                        logits = logits[0]
                     pred = logits.argmax(dim=1)
                     if correct is None:
                         num_cls = int(max(logits.shape[1], int(y.max()) + 1))
