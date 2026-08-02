@@ -632,7 +632,16 @@ class FLOFA_Trainer(ABC):
     def _tier_id_for_config(self, config):
         """Map an architecture config back to its diverse_subnets key
         ("0".."3"), for tier-level debt tracking (comm_sim.policies). None if
-        config doesn't match any configured tier (e.g. a non-tier arch)."""
+        config doesn't match any configured tier (e.g. a non-tier arch).
+
+        Single-architecture models have no tier ladder at all: ServerDarts (the
+        FedNAS-DARTS baseline) carries a Genotype as its model_config, which is
+        not a mapping. Every caller already handles None, so returning it early
+        lets the whole tier machinery — debt tables, [assign_matrix], the policy
+        hooks — degrade to a no-op for those models instead of crashing.
+        """
+        if not isinstance(config, dict):
+            return None
         target = self._normalize_arch(config)
         for tier_id, cfg in self.args.diverse_subnets.items():
             if self._normalize_arch(cfg) == target:
