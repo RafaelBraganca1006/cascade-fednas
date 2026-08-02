@@ -110,7 +110,11 @@ def load_cifar10_data(datadir):
     return (X_train, y_train, X_test, y_test)
 
 
-def partition_data(dataset, datadir, partition, n_nets, alpha, load_from_pkl):
+def partition_data(dataset, datadir, partition, n_nets, alpha, load_from_pkl=False):
+    # load_from_pkl defaults to False so the DISTRIBUTED loader below still
+    # works: it was added for the standalone path (which passes it explicitly)
+    # and made required, which broke load_partition_data_distributed_cifar10 --
+    # the entry point FedNAS-DARTS uses. False reproduces the original behaviour.
     logging.info("*********partition data***************")
     X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
     if load_from_pkl:
