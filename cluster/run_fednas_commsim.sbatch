@@ -47,6 +47,12 @@
 module add cuda/12.9
 source /work/scratch/$USER/dynfednas-venv/bin/activate
 export WANDB_MODE=online
+# FedML's comm layer imports its gRPC backend unconditionally, even though this
+# run is MPI, and its generated _pb2.py files predate protobuf 4.x ("Descriptors
+# cannot be created directly"). We never touch protobuf, so the documented
+# pure-Python fallback costs nothing here -- and it is safer than downgrading
+# protobuf, which wandb also depends on.
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 ROUNDS="${1:-3}"
 COMMSIM="${2:-on}"
