@@ -139,6 +139,21 @@ MODEL="${13:-ofaresnet50_32x32_10_26}"
 DARTS_C="${14:-128}"      # channels; sets the payload, see below
 DARTS_LAYERS="${15:-20}"
 
+# The DARTS baseline has ONE architecture, so the supernet machinery has to be
+# switched off for it: TS_all_random calls get_subnet(**arch_config) and
+# ServerDarts returns a Genotype, not a mapping (that is the crash), and
+# MaxNet's beta schedule is meaningless with a single subnet -- FedNAS is plain
+# FedAvg over one net. `static` + a single empty tier reproduces exactly that.
+SUBNETS='{"0":{"d":[0,0,0,0],"e":0.1},"1":{"d":[0,1,0,1],"e":0.14},"2":{"d":[1,1,1,1],"e":0.18},"3":{"d":[2,2,2,2],"e":0.25}}'
+AVGSCHED='{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}'
+SCHED_FLAG="--weighted_avg_schedule $AVGSCHED"
+if [ "$MODEL" = "darts" ]; then
+  SUBNETS='{"0":{}}'
+  SAMPLER="static"
+  SCHED_FLAG=""
+  echo "=== darts: single-architecture baseline -> sampler=static, no MaxNet schedule ==="
+fi
+
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
   SEL_FLAG="--selection_policy $SELECTION"
@@ -167,8 +182,8 @@ python train.py \
   --client_num_in_total 20 --client_num_per_round 8 --comm_round "$ROUNDS" \
   --epochs 5 --batch_size 64 --client_optimizer sgd --lr 0.1 --ci 0 \
   --subnet_dist_type "$SAMPLER" \
-  --diverse_subnets '{"0":{"d":[0,0,0,0],"e":0.1},"1":{"d":[0,1,0,1],"e":0.14},"2":{"d":[1,1,1,1],"e":0.18},"3":{"d":[2,2,2,2],"e":0.25}}' \
-  --weighted_avg_schedule '{"type":"maxnet_cos_all_subnet","num_steps":120,"init":0.9,"final":0.125}' \
+  --diverse_subnets "$SUBNETS" \
+  $SCHED_FLAG \
   --frequency_of_the_test "$EVALFREQ" --partition_alpha "$ALPHA" --init_seed 0 \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
   --block_order "$BLOCKORDER" --stream_pivot "$PIVOT" \
