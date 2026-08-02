@@ -62,7 +62,7 @@
 #     # 5 rounds. Replaces e6b_103896, whose numbers carry the bug.
 #
 # ARGS: <SELECTION> [ROUNDS] [CORR] [DEADLINE] [ALPHA] [JITTER] [TXMODE] [MAXNETFIX]
-#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT] [SAMPLER] [MODEL] [DARTS_C] [DARTS_LAYERS]
+#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT] [SAMPLER] [MODEL] [DARTS_C] [DARTS_LAYERS] [BATCH]
 #
 #   sbatch cluster/run_selection_probe.sbatch none 200 0.0 40 0.5 0.45 nested_blocks on fixed 10 1
 #     # cohort-complementary streaming (DIRECTION 3.1d) vs the shell-major
@@ -138,6 +138,14 @@ SAMPLER="${12:-TS_all_random}"
 MODEL="${13:-ofaresnet50_32x32_10_26}"
 DARTS_C="${14:-128}"      # channels; sets the payload, see below
 DARTS_LAYERS="${15:-20}"
+# Local batch size. 64 for every supernet arm. The darts baseline needs less:
+# at C=128/layers=20 a single process OOMs at 15.3 GiB with batch 64. Memory is
+# dominated by ACTIVATIONS (proportional to batch), the payload by PARAMETERS
+# (independent of it) -- so shrinking the batch keeps the 52.7 MB payload that
+# puts FedNAS between our S (41.6 MB) and M (98.6 MB) tiers, which is what makes
+# the comparison meaningful. The arm's claim is comm_sim ON vs OFF, internal to
+# FedNAS, so the batch difference does not touch it; state it in the text.
+BATCH="${16:-64}"
 
 # The DARTS baseline has ONE architecture, so the supernet machinery has to be
 # switched off for it: TS_all_random calls get_subnet(**arch_config) and
@@ -180,7 +188,7 @@ python train.py \
   --model "$MODEL" --init_channel_size "$DARTS_C" --darts_layers "$DARTS_LAYERS" \
   --partition_method hetero \
   --client_num_in_total 20 --client_num_per_round 8 --comm_round "$ROUNDS" \
-  --epochs 5 --batch_size 64 --client_optimizer sgd --lr 0.1 --ci 0 \
+  --epochs 5 --batch_size "$BATCH" --client_optimizer sgd --lr 0.1 --ci 0 \
   --subnet_dist_type "$SAMPLER" \
   --diverse_subnets "$SUBNETS" \
   $SCHED_FLAG \
