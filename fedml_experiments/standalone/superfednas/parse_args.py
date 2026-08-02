@@ -271,6 +271,7 @@ def add_args(parser):
             "PS",
             "policy_assign",
             "capacity_aware",
+            "capacity_rank",
         ],
         help="Subnetwork selection strategy for every round",
     )

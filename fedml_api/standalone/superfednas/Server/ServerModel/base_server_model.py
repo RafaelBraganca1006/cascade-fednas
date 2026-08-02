@@ -50,6 +50,7 @@ class BaseServerModel(ABC):
         self.subnet_sampling["TS_KD"] = self.tracking_sandwich_kd
         self.subnet_sampling["PS"] = self.ps
         self.subnet_sampling["capacity_aware"] = self.capacity_aware_sample
+        self.subnet_sampling["capacity_rank"] = self.capacity_rank_sample
         self.subnet_sampling["policy_assign"] = self.policy_assign_sample
 
         # dynFedNAS capacity-aware sampling state (Phase 3). cap_bw is None when
@@ -448,6 +449,80 @@ class BaseServerModel(ABC):
                 arch_config = self._largest_affordable_tier(budget_bits)
                 client_model = self.get_subnet(**arch_config)
                 self.cap_num_clamped += 1
+        if self.is_max_net(arch_config):
+            self.cli_subnet_track[client_idx]["largest"] += 1
+        elif self.is_min_net(arch_config):
+            self.cli_subnet_track[client_idx]["smallest"] += 1
+        return client_model
+
+    def capacity_rank_sample(self, round_num, client_idx, idx, args):
+        """MaxFit's successor: assign the ladder by BANDWIDTH RANK, not by a
+        threshold on what fits.
+
+        Why capacity_aware is not enough. It draws the architecture exactly like
+        TS_all_random and then only ever CLAMPS DOWN when the payload exceeds the
+        budget -- it never assigns up. So a well-connected client that happened to
+        draw S keeps S, and the scarcest resource in the federation (a good link,
+        the only kind that can carry the top of the ladder) is spent on the
+        cheapest region. Under a tight deadline the clamp also shifts the whole
+        architecture distribution downward, which is a plausible cause of the flat
+        front capacity_aware produces (spread -0.31 at alpha=100/T=20).
+
+        The rule here is relative rather than absolute: of the round's middle
+        clients, the one with the best estimated budget gets the largest tier, the
+        worst gets the smallest, monotonically in between. Nobody's good link is
+        wasted, and the top of the ladder is assigned to SOMEBODY every round even
+        when no client could deliver it in full.
+
+        That last part is only safe because delivery is anytime (DIRECTION 3.1):
+        under all-or-nothing, assigning a subnet the client cannot finish is a
+        guaranteed loss and this rule would be strictly worse than the clamp;
+        under nested/nested_blocks it is a partial contribution. The mechanism is
+        what makes the more aggressive assignment affordable -- it does not
+        replace the assignment layer, it changes what that layer can do.
+
+        Deliberate consequence, to state rather than hide: this makes the
+        architecture distribution bandwidth-CORRELATED, where TS_all_random's is
+        uniform over the elastic space (which is OFA's supernet-training
+        premise). That is the treatment, not a confound -- but it does mean a
+        comparison against blind measures rule AND distribution together, exactly
+        the caveat DIRECTION 3.2b fact 4 raised about policy_assign.
+        """
+        # The forced min/max slots are MaxNet's sandwich and are left untouched:
+        # capacity_aware already restricts the max slot to clients that can
+        # afford it, so the top of the ladder is not the problem being fixed.
+        if self.cli_subnet_track[client_idx] is None:
+            self.cli_subnet_track[client_idx] = dict()
+        if client_idx in self.smallest_subnet_min_idx:
+            self.cli_subnet_track[client_idx]["smallest"] += 1
+            return self.get_subnet(**self.min_subnet_arch())
+        if client_idx in self.largest_subnet_min_idx:
+            self.cli_subnet_track[client_idx]["largest"] += 1
+            return self.get_subnet(**self.max_subnet_arch())
+
+        # No bandwidth picture (comm_sim off) -> fall back to the blind draw, so
+        # this sampler degenerates to TS_all_random exactly like capacity_aware.
+        if self.cap_bw is None or not self._cap_tier_bits:
+            np.random.seed(round_num + client_idx)
+            return self.get_subnet(**self.random_subnet_arch())
+
+        middle = [
+            c for c in self.cli_indices
+            if c not in self.smallest_subnet_min_idx
+            and c not in self.largest_subnet_min_idx
+        ]
+        # (bandwidth, client) so ties break deterministically
+        order = sorted(middle, key=lambda c: (self.cap_bw.get(c, 0.0), c))
+        try:
+            rank = order.index(client_idx)
+        except ValueError:                      # not a middle client this round
+            np.random.seed(round_num + client_idx)
+            return self.get_subnet(**self.random_subnet_arch())
+
+        n_tiers = len(self._cap_tier_bits)
+        tier = (rank * n_tiers) // max(len(order), 1)
+        arch_config = self._cap_tier_bits[min(tier, n_tiers - 1)][1]
+        client_model = self.get_subnet(**arch_config)
         if self.is_max_net(arch_config):
             self.cli_subnet_track[client_idx]["largest"] += 1
         elif self.is_min_net(arch_config):
