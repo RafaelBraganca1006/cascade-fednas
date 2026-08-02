@@ -121,6 +121,9 @@ class FLOFA_Trainer(ABC):
                     name: [c for c, t in enumerate(client_tiers) if t == i]
                     for i, name in enumerate(MarkovBandwidth.TIER_NAMES)
                 }
+                # reused by _log_assignment_matrix: the bias is per connectivity
+                # group, so the matrix is meaningless without this split
+                self._conn_tiers = by_tier
                 logging.info(
                     "[comm_sim] connectivity tiers (corr=%.2f): %s"
                     % (getattr(self.args, "bw_data_corr", 0.0), by_tier)
@@ -179,6 +182,17 @@ class FLOFA_Trainer(ABC):
         if not hasattr(self, "_cls_counts"):
             self._cls_counts = None  # only set under a tiered bw profile above
         self._client_delivered_counts = {
+            c: {} for c in range(self.args.client_num_in_total)
+        }
+        # ASSIGNED tier per client, alongside the DELIVERED counts above. The
+        # pair is what makes assignment bias measurable instead of argued: a
+        # bandwidth-ranked rule (capacity_rank) gives the well-connected clients
+        # the large subnets every round, so the top of the architecture space
+        # only ever sees their data -- the architecture/data coupling this
+        # thesis criticises in other methods (DIRECTION 3.4). Assigned shows the
+        # rule's intent, delivered shows what the channel left of it, and the
+        # gap between them is the mechanism's contribution.
+        self._client_assigned_counts = {
             c: {} for c in range(self.args.client_num_in_total)
         }
         self._client_last_delivery_round = {
@@ -776,6 +790,36 @@ class FLOFA_Trainer(ABC):
         counts[delivered_tier_id] = counts.get(delivered_tier_id, 0) + 1
         self._client_last_delivery_round[client_idx] = round_num
 
+    def _log_assignment_matrix(self, round_num):
+        """client x tier, assigned and delivered (DIRECTION 3.4, 3.2-pre).
+
+        The quantity that makes assignment bias a number rather than a claim.
+        Grouped by connectivity tier when one exists, because that is where the
+        bias lives: under a bandwidth-ranked rule the well-connected clients
+        take the large subnets every round, so the top of the architecture space
+        only ever sees their data. At alpha=100 that costs nothing (every client
+        holds the same class mix), which is exactly why it must be measured at
+        the non-IID ablation and not only at the canonical config.
+        """
+        tiers = sorted(self.args.diverse_subnets.keys())
+        groups = getattr(self, "_conn_tiers", None) or {
+            "all": list(range(self.args.client_num_in_total))
+        }
+        for what, table in (("assigned", self._client_assigned_counts),
+                            ("delivered", self._client_delivered_counts)):
+            for gname, members in sorted(groups.items()):
+                tot = {t: 0 for t in tiers}
+                for c in members:
+                    for t, n in table.get(c, {}).items():
+                        if t in tot:
+                            tot[t] += n
+                s = sum(tot.values()) or 1
+                logging.info(
+                    "[assign_matrix] round %d %s %-8s %s  (n=%d)"
+                    % (round_num, what, gname,
+                       " ".join("t%s=%.3f" % (t, tot[t] / s) for t in tiers), s)
+                )
+
     def _log_selection_metrics(self, round_num, selected, delivered_clients):
         """[selection] round line: dead slots + coverage spread. This is the
         `fig_dead_slots` data and the only visibility into whether a selection
@@ -1079,10 +1123,12 @@ class FLOFA_Trainer(ABC):
             client_model = self.server_model.sample_subnet(
                 round_num, client_idx, idx, self.sampler_args
             )
-            if policy_tier_counts is not None:
-                tid = self._tier_id_for_config(client_model.model_config)
-                if tid is not None:
-                    policy_tier_counts[tid] += 1
+            assigned_tid = self._tier_id_for_config(client_model.model_config)
+            if assigned_tid is not None:
+                a = self._client_assigned_counts.setdefault(int(client_idx), {})
+                a[assigned_tid] = a.get(assigned_tid, 0) + 1
+            if policy_tier_counts is not None and assigned_tid is not None:
+                policy_tier_counts[assigned_tid] += 1
             if self.args.dry_run:
                 flops, _ = fp.profile(client_model.model, (1, 3, 32, 32))
                 gflops = flops / 10e8
@@ -1591,6 +1637,8 @@ class FLOFA_Trainer(ABC):
             )
         if self.comm_sim is not None:
             self._log_selection_metrics(round_num, client_indexes, delivered_clients)
+            if round_num % 10 == 0 or round_num == self.args.comm_round - 1:
+                self._log_assignment_matrix(round_num)
         if self.args.dry_run:
             avg_gflops /= self.args.client_num_per_round
             avg_params /= self.args.client_num_per_round
