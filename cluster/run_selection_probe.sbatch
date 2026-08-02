@@ -62,7 +62,7 @@
 #     # 5 rounds. Replaces e6b_103896, whose numbers carry the bug.
 #
 # ARGS: <SELECTION> [ROUNDS] [CORR] [DEADLINE] [ALPHA] [JITTER] [TXMODE] [MAXNETFIX]
-#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT] [SAMPLER]
+#       [BLOCKORDER] [EVALFREQ] [STREAM_PIVOT] [SAMPLER] [MODEL] [DARTS_C] [DARTS_LAYERS]
 #
 #   sbatch cluster/run_selection_probe.sbatch none 200 0.0 40 0.5 0.45 nested_blocks on fixed 10 1
 #     # cohort-complementary streaming (DIRECTION 3.1d) vs the shell-major
@@ -126,6 +126,18 @@ PIVOT="${11:--1}"
 # headline table has a hole. It reads --bw_estimate, which is why every arm here
 # passes `lagged`: oracle would be an unfair advantage for MaxFit specifically.
 SAMPLER="${12:-TS_all_random}"
+# Model. ofaresnet50_32x32_10_26 is the supernet every DynFedNAS arm uses.
+# "darts" is the FedNAS-DARTS baseline (E2c): train.py builds it from
+# genotypes.FedNAS_V1 -- the architecture FedNAS published -- with NetworkCIFAR,
+# i.e. a FIXED net, no DARTS search. That matches what the anchor did
+# (SuperFedNAS 4.1: "the DNN-archs of FedNAS, FedPNAS are kept the same as
+# described in that method") and it means the baseline runs on THIS standalone
+# path with the same comm_sim, the same 20 clients / 8 per round and the same
+# seeds -- no MPI, and none of the memory blowup that killed the distributed
+# route (9 DARTS *search* supernets on one GPU: one rank alone took 7.7 GiB).
+MODEL="${13:-ofaresnet50_32x32_10_26}"
+DARTS_C="${14:-128}"      # channels; sets the payload, see below
+DARTS_LAYERS="${15:-20}"
 
 SEL_FLAG=""
 if [ "$SELECTION" != "none" ]; then
@@ -144,13 +156,14 @@ else
     COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
   fi
 fi
-RUN_NAME="e6b_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+RUN_NAME="e6b_${MODEL:0:6}_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
 python train.py \
   --gpu 0 --dataset cifar10 --data_dir ./../../../data/cifar10 \
-  --model ofaresnet50_32x32_10_26 --partition_method hetero \
+  --model "$MODEL" --init_channel_size "$DARTS_C" --darts_layers "$DARTS_LAYERS" \
+  --partition_method hetero \
   --client_num_in_total 20 --client_num_per_round 8 --comm_round "$ROUNDS" \
   --epochs 5 --batch_size 64 --client_optimizer sgd --lr 0.1 --ci 0 \
   --subnet_dist_type "$SAMPLER" \
