@@ -233,9 +233,110 @@ def test_off_switch():
     print("[ok] comm_sim off: capacity_aware falls back to TS behaviour")
 
 
+def test_capacity_rank_is_monotone_in_bandwidth():
+    """capacity_rank must order the ladder by bandwidth RANK. This also catches
+    the silent failure that shipped once: if the trainer forgets to call
+    set_capacity_info() for a new sampler, cap_bw stays None, the sampler falls
+    back to a blind random draw, and the run completes looking like a duplicate
+    of the TS_all_random arm. A monotonicity check fails loudly instead."""
+    cap = make_server("capacity_rank")
+    bw = {0: 2e6, 1: 6e6, 2: 11e6, 3: 19e6, 4: 28e6, 5: 33e6, 6: 44e6, 7: 55e6}
+    def payload(cfg):                      # stub tiers use a scalar d
+        d = cfg["d"]
+        return sum(d) if isinstance(d, (list, tuple)) else d
+    inversions = rounds = 0
+    for r in range(40):
+        cfgs = run_round(cap, r, bw=bw)   # list indexed by client
+        forced = cap.smallest_subnet_min_idx | cap.largest_subnet_min_idx
+        middle = sorted(c for c in range(NUM_CLI) if c not in forced)
+        if len(middle) < 2:
+            continue
+        rounds += 1
+        sizes = [payload(cfgs[c]) for c in sorted(middle, key=lambda c: bw[c])]
+        inversions += sum(
+            1 for i in range(len(sizes) - 1) if sizes[i] > sizes[i + 1]
+        )
+    assert rounds > 0, "no round had middle clients"
+    assert inversions == 0, (
+        "assignment is not monotone in bandwidth (%d inversions over %d rounds)"
+        " -- if this is 0 sizes everywhere, set_capacity_info() was never called"
+        % (inversions, rounds)
+    )
+    print("[ok] capacity_rank: monotone in bandwidth over %d rounds" % rounds)
+
+
+def test_capacity_rank_uses_the_whole_ladder():
+    """The point of rank over MaxFit's clamp: the top of the ladder is assigned
+    every round even when nobody could deliver it whole. If the sampler silently
+    degraded to a blind draw or to the clamp, the large tiers would vanish."""
+    cap = make_server("capacity_rank")
+    bw = {c: 2e6 + c * 1e6 for c in range(NUM_CLI)}  # everyone poor
+    seen = set()
+    for r in range(40):
+        for cfg in run_round(cap, r, bw=bw):
+            d = cfg["d"]
+            seen.add(sum(d) if isinstance(d, (list, tuple)) else d)
+    assert len(seen) >= 3, (
+        "rank assignment collapsed to %d distinct sizes under a poor federation;"
+        " MaxFit's clamp is what does that, rank must not" % len(seen)
+    )
+    print("[ok] capacity_rank: %d distinct depths even with every client poor"
+          % len(seen))
+
+
+def test_every_bandwidth_sampler_is_wired_in_the_trainer():
+    """Guard for a class of SILENT bug, not for the sampler itself.
+
+    A sampler that reads self.cap_bw only receives it if the trainer lists it in
+    the gate that calls set_capacity_info(). Miss one and cap_bw stays None, the
+    sampler quietly falls back to a blind draw, and an 8-hour run completes
+    looking like a duplicate of the TS_all_random arm -- no crash, no warning.
+    That is exactly what happened to capacity_rank on its first submission.
+
+    The other self-tests cannot catch this: run_round() calls set_capacity_info()
+    itself, so they exercise the sampler with the wiring already done. This one
+    reads the trainer source instead.
+    """
+    import os
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    model_src = open(
+        os.path.join(here, "..", "Server", "ServerModel", "base_server_model.py")
+    ).read()
+    trainer_src = open(
+        os.path.join(here, "..", "Server", "ServerTrainer", "superfednas_trainer.py")
+    ).read()
+
+    # samplers registered in subnet_sampling whose body reads cap_bw
+    readers = set()
+    pairs = re.findall(r'subnet_sampling\["(\w+)"\] = self\.(\w+)', model_src)
+    for name, fn in pairs:
+        body = re.search(r'def ' + fn + r'\(.*?(?=\n    def )', model_src, re.S)
+        if body and 'self.cap_bw' in body.group(0):
+            readers.add(name)
+    assert readers, 'found no bandwidth-reading samplers -- regex out of date?'
+
+    gate = re.search(r'subnet_dist_type in \(([^)]*)\)', trainer_src)
+    assert gate, 'could not find the set_capacity_info gate in the trainer'
+    listed = set(re.findall(r'"(\w+)"', gate.group(1)))
+
+    missing = readers - listed
+    assert not missing, (
+        'these samplers read cap_bw but the trainer never calls '
+        'set_capacity_info() for them, so they would silently run blind: %s'
+        % sorted(missing)
+    )
+    print('[ok] wiring: all %d bandwidth-reading samplers are in the trainer '
+          'gate (%s)' % (len(readers), ', '.join(sorted(readers))))
+
+
 if __name__ == "__main__":
     test_equivalence_with_ts()
     test_payloads_fit()
+    test_capacity_rank_is_monotone_in_bandwidth()
+    test_capacity_rank_uses_the_whole_ladder()
+    test_every_bandwidth_sampler_is_wired_in_the_trainer()
     test_max_slot_eligible_and_rotates()
     test_infeasible_fallback()
     test_off_switch()

@@ -1054,8 +1054,14 @@ class FLOFA_Trainer(ABC):
         # maxnet aggregation weight tied to it) only lands on eligible clients.
         # "oracle" assigns with this round's true bandwidth; "lagged" assigns
         # with the previous round's (realistic: the estimate can be stale).
+        # NOTE: every bandwidth-reading sampler must be listed here. Omitting one
+        # is SILENT -- set_capacity_info() is skipped, cap_bw stays None, and the
+        # sampler falls back to a blind random draw, so the run completes and
+        # looks like a duplicate of the TS_all_random arm. capacity_rank was
+        # missing on its first submission and would have wasted an 8h job.
         if self.comm_sim is not None and self.args.subnet_dist_type in (
             "capacity_aware",
+            "capacity_rank",
             "policy_assign",
         ):
             bw_round = round_num
@@ -1559,7 +1565,7 @@ class FLOFA_Trainer(ABC):
                 comm_summary["comm/shard_coverage"] = comm_summary.get(
                     "comm/shard_units_delivered", 0
                 ) / len(self._unit_bits)
-            if self.args.subnet_dist_type == "capacity_aware":
+            if self.args.subnet_dist_type in ("capacity_aware", "capacity_rank"):
                 comm_summary["capacity/num_clamped"] = (
                     self.server_model.cap_num_clamped
                 )
@@ -1569,7 +1575,7 @@ class FLOFA_Trainer(ABC):
             for _k, _v in comm_summary.items():
                 wandb.log({_k: _v, "round": round_num}, step=round_num)
             capacity_note = ""
-            if self.args.subnet_dist_type == "capacity_aware":
+            if self.args.subnet_dist_type in ("capacity_aware", "capacity_rank"):
                 capacity_note = " clamped=%d max_infeasible=%d" % (
                     self.server_model.cap_num_clamped,
                     self.server_model.cap_max_infeasible,
