@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=e6b_%j.out
