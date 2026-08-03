@@ -198,6 +198,31 @@ class FLOFA_Trainer(ABC):
         self._client_last_delivery_round = {
             c: -1 for c in range(self.args.client_num_in_total)
         }
+        # ---- coverage debt, maintained UNCONDITIONALLY --------------------
+        # Both tables used to be created inside the policy_assign branch and
+        # updated behind `subnet_dist_type == "policy_assign"` guards. That is
+        # the silent-wiring bug that already cost capacity_rank an 8h run: a new
+        # sampler reads a table nobody filled, sees zeros, and quietly behaves
+        # like something else while completing normally. They are two small
+        # dicts -- maintaining them always is cheaper than remembering to add
+        # each new sampler to three separate conditions.
+        #
+        # tier_debt      -> objective B in DIRECTION 3.2-pre: when was this
+        #                   region last refreshed by ANYONE.
+        # client_tier_debt -> objective C: when did THIS client last train this
+        #                   region. Aggregate staleness is data-blind; it can
+        #                   say when a tier was refreshed, never by whom, and
+        #                   under non-IID that is the whole question.
+        # -1 = never served, so initial staleness is large everywhere.
+        self._tier_last_round = {
+            tier_id: -1 for tier_id in self.args.diverse_subnets
+        }
+        self._client_tier_last_round = {
+            client_idx: {tier_id: -1 for tier_id in self.args.diverse_subnets}
+            for client_idx in range(self.args.client_num_in_total)
+        }
+        self.sampler_args["tier_debt"] = self._tier_last_round
+        self.sampler_args["client_tier_debt"] = self._client_tier_last_round
         self._selection_policy = None
         sel_name = getattr(self.args, "selection_policy", "none")
         if sel_name != "none":
@@ -259,27 +284,6 @@ class FLOFA_Trainer(ABC):
                 "[policy] assignment_policy=%s active (lambda=%s)"
                 % (policy_name, lam)
             )
-            # Tier-level debt table (DIRECTION §3.2/§3.3): the Lyapunov virtual
-            # queues Q_u(t), at TIER granularity (unlike the shard path's
-            # per-BLOCK `_unit_last_round`). -1 = never served, so initial
-            # staleness (round_num - last_round) is large for every tier.
-            # Live reference stashed in sampler_args -- policy_assign_sample
-            # reads it fresh every round without needing per-round rewiring.
-            self._tier_last_round = {
-                tier_id: -1 for tier_id in self.args.diverse_subnets
-            }
-            self.sampler_args["tier_debt"] = self._tier_last_round
-            # Per-(client, tier) debt table (DIRECTION §3.2, added 2026-07-26
-            # after the non-IID pilot found debt_by_tier's aggregate staleness
-            # is data-blind: it can't tell a policy WHICH client refreshed a
-            # tier, only WHEN. {client_idx: {tier_id: last_round}}. Only the
-            # bandit consumes this (comm_sim/policies/bandit.py); Lyapunov's
-            # per-tier-only design is left untouched on purpose.
-            self._client_tier_last_round = {
-                client_idx: {tier_id: -1 for tier_id in self.args.diverse_subnets}
-                for client_idx in range(self.args.client_num_in_total)
-            }
-            self.sampler_args["client_tier_debt"] = self._client_tier_last_round
             # Cheap (config, loss) data-utility report (DIRECTION §3.2 /
             # FEEDBACK_REVIEW.md): every client's last local training loss,
             # always available regardless of bandwidth. {client_idx: {config,
@@ -1268,10 +1272,10 @@ class FLOFA_Trainer(ABC):
                         delivery_completeness = min(
                             tx_report.bits_delivered / intended_bits, 1.0
                         )
-                    if (
-                        self.args.subnet_dist_type == "policy_assign"
-                        and tx_report.delivered_tier is not None
-                    ):
+                    # unconditional: see the note on the debt tables in
+                    # __init__ -- gating this on a sampler name is how a new
+                    # sampler silently reads an empty table
+                    if tx_report.delivered_tier is not None:
                         self._mark_stream_debt_served(
                             round_num, client_idx, stream_plan, tx_report
                         )
@@ -1384,10 +1388,7 @@ class FLOFA_Trainer(ABC):
                             delivery_completeness = min(
                                 tx_report.bits_delivered / intended_bits, 1.0
                             )
-                        if (
-                            self.args.subnet_dist_type == "policy_assign"
-                            and tx_report.delivered_tier is not None
-                        ):
+                        if tx_report.delivered_tier is not None:
                             self._mark_tier_debt_served(
                                 round_num, client_idx, plan, tx_report.delivered_tier
                             )
