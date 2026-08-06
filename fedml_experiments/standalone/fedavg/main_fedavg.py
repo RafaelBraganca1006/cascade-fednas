@@ -88,6 +88,33 @@ def add_args(parser):
 
     parser.add_argument('--ci', type=int, default=0,
                         help='CI')
+
+    # ---- dynFedNAS: the bandwidth simulator (docs/EXPERIMENTS.md E10) ----
+    # Same flags, same names and same defaults as the superfednas entry point,
+    # so an arm of this baseline and an arm of ours are configured by the same
+    # strings and a reader can diff the two Namespaces directly.
+    parser.add_argument('--comm_sim', action='store_true',
+                        help='Enable the round-deadline bandwidth simulator. '
+                             'FedAvg has one fixed architecture with no subset '
+                             'structure, so delivery is necessarily '
+                             'all-or-nothing -- it cannot have anytime '
+                             'delivery, which is the point this arm measures.')
+    parser.add_argument('--bw_deadline', type=float, default=20.0,
+                        help='Round time budget in seconds (canonical: 20).')
+    parser.add_argument('--bw_seed', type=int, default=0,
+                        help='Seed for the bandwidth chains AND the '
+                             'connectivity-tier assignment.')
+    parser.add_argument('--bw_profile', type=str, default='tiered_continuous',
+                        choices=['uniform', 'tiered', 'tiered_continuous'],
+                        help='Connectivity heterogeneity. Canonical: '
+                             'tiered_continuous.')
+    parser.add_argument('--bw_jitter_sigma', type=float, default=0.45,
+                        help='Log-normal within-state spread for '
+                             'tiered_continuous (canonical: 0.45).')
+    parser.add_argument('--bw_data_corr', type=float, default=0.0,
+                        help='Correlation in [0,1] between a client'"'"'s '
+                             'connectivity tier and its label distribution. '
+                             'Canonical: 0.')
     return parser
 
 
@@ -287,8 +314,13 @@ if __name__ == "__main__":
     logger.info(device)
 
     wandb.init(
-        project="fedml",
-        name="FedAVG-r" + str(args.comm_round) + "-e" + str(args.epochs) + "-lr" + str(args.lr),
+        project="dynfednas",
+        entity="rbraganca-eth-z-rich",
+        name="fedavg_%s_%s_d%s_a%s_r%s" % (
+            args.model,
+            "comm" if getattr(args, "comm_sim", False) else "nocomm",
+            args.bw_deadline, args.partition_alpha, args.comm_round,
+        ),
         config=args
     )
 
@@ -307,7 +339,10 @@ if __name__ == "__main__":
     # create model.
     # Note if the model is DNN (e.g., ResNet), the training will be very slow.
     # In this case, please use our FedML distributed version (./fedml_experiments/distributed_fedavg)
-    model = create_model(args, model_name=args.client_model, output_dim=dataset[7])
+    # args.client_model does not exist -- the flag is --model. Upstream FedML
+    # bug: this entry point crashes with AttributeError before doing anything.
+    # Found 2026-08-06 while wiring the comm simulator in.
+    model = create_model(args, model_name=args.model, output_dim=dataset[7])
     model_trainer = custom_model_trainer(args, model)
     logging.info(model)
 
