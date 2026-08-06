@@ -1,8 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fedavg_commsim
 #SBATCH --time=24:00:00
-#SBATCH --mem-per-cpu=12G
-#SBATCH --cpus-per-task=2
+#SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=fedavg_%j.out
 #
