@@ -271,9 +271,28 @@ def create_model(args, model_name, output_dim):
     elif model_name == "cnn" and args.dataset == "femnist":
         logging.info("CNN + FederatedEMNIST")
         model = CNN_DropOut(False)
-    elif model_name == "resnet18_gn" and args.dataset == "fed_cifar100":
-        logging.info("ResNet18_GN + Federated_CIFAR100")
-        model = resnet18()
+    elif model_name == "resnet18_gn":
+        # Upstream gated this on dataset == "fed_cifar100". Relaxed 2026-08-06
+        # so it can be used on cifar10, and the reason is the whole point of
+        # the arm: PAYLOAD MATCHING.
+        #
+        # The FedAvg baseline exists to show what a round deadline does to a
+        # method with one fixed, atomic update. That is only measurable if the
+        # deadline actually binds. resnet56 is 0.59 M params = 2.4 MB, against
+        # our tier ladder of 41.6 / 98.6 / 137.6 / 286.9 MB -- measured in the
+        # 3-round smoke (job 104317): participation 1.00, 0 drops in every
+        # round. At that size the deadline never binds and a 150-round arm
+        # would be measuring "a 100x smaller model is unaffected", which is a
+        # statement about model size, not about the mechanism.
+        #
+        # resnet18_gn is 11.18 M params = 44.7 MB, i.e. essentially our S tier
+        # (41.6 MB). Same channel, same deadline, comparable payload -- so the
+        # comparison is about the delivery mechanism and nothing else.
+        #
+        # num_classes, not class_num: this constructor takes the torchvision
+        # keyword while resnet56/mobilenet next to it take class_num.
+        logging.info("ResNet18_GN (payload-matched to the S tier, ~44.7 MB)")
+        model = resnet18(num_classes=output_dim)
     elif model_name == "rnn" and args.dataset == "shakespeare":
         logging.info("RNN + shakespeare")
         model = RNN_OriginalFedAvg()
