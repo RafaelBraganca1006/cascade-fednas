@@ -99,6 +99,23 @@ python main_fedavg.py \
   --frequency_of_the_test "$EVALFREQ" \
   $COMM_FLAGS
 
+# ---------------------------------------------------------------------------
+# Summary block. `set -e` is DISABLED here on purpose.
+#
+# Job 104464 completed 150 rounds, 16 evaluations and no traceback, and Slurm
+# still marked it FAILED. Cause: `set -euo pipefail` plus `head -3`. head exits
+# after three lines, closes the pipe, grep takes SIGPIPE and returns non-zero,
+# pipefail propagates it, and `set -e` kills the script -- AFTER the training
+# has already finished. Nothing is wrong with the run; the exit status lies.
+#
+# That is worse than a cosmetic bug: a FAILED status on a good run invites
+# re-running an arm that already produced valid data (this project has burned
+# ~9 h to exactly that mistake before -- see the process note on v2_arm_cprime
+# in results/README.md). So the reporting block must never decide the job's
+# exit status.
+set +e
+set +o pipefail
+
 OUT="$SLURM_SUBMIT_DIR/fedavg_$SLURM_JOB_ID.out"
 echo "=== FedAvg done -- summary ==="
 grep "\[comm_sim\] enabled"  "$OUT" 2>/dev/null | head -1
@@ -106,3 +123,7 @@ grep "\[comm_sim\] round"    "$OUT" 2>/dev/null | tail -1
 echo "--- SMOKE CHECK: the loss must be clearly below ln(10)=2.303 and falling."
 grep -oE "Loss: [0-9.]+" "$OUT" 2>/dev/null | head -3
 grep -oE "Loss: [0-9.]+" "$OUT" 2>/dev/null | tail -3
+
+# Explicit success: the training command above ran under `set -e`, so reaching
+# this line means it exited 0.
+exit 0
