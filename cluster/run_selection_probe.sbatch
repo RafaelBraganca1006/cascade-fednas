@@ -141,10 +141,16 @@ DARTS_LAYERS="${15:-20}"
 # Local batch size. 64 for every supernet arm. The darts baseline needs less:
 # at C=128/layers=20 a single process OOMs at 15.3 GiB with batch 64. Memory is
 # dominated by ACTIVATIONS (proportional to batch), the payload by PARAMETERS
-# (independent of it) -- so shrinking the batch keeps the 52.7 MB payload that
-# puts FedNAS between our S (41.6 MB) and M (98.6 MB) tiers, which is what makes
-# the comparison meaningful. The arm's claim is comm_sim ON vs OFF, internal to
-# FedNAS, so the batch difference does not touch it; state it in the text.
+# (independent of it) -- so shrinking the batch does not change the payload.
+# CORRECTION 2026-08-08: an earlier version of this comment claimed that payload
+# was 52.7 MB, "between our S (41.6 MB) and M (98.6 MB) tiers". That is WRONG.
+# NetworkCIFAR(C=128, layers=20) is 6.61 M parameters = 201.9 MB, i.e. between
+# our L (137.6 MB) and XL (286.9 MB) tiers -- measured directly in
+# analysis/sweep_deadline.py. The wrong figure was never load-bearing for a
+# claim, but it did travel into a figure caption before being caught, and 202 MB
+# is what actually explains the arm's 95% drop rate (44.7 MB gives ~49%).
+# The arm's claim is comm_sim ON vs OFF, internal to FedNAS, so the batch
+# difference does not touch it; state it in the text.
 BATCH="${16:-64}"
 
 # The DARTS baseline has ONE architecture, so the supernet machinery has to be
