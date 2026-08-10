@@ -184,6 +184,14 @@ class FLOFA_Trainer(ABC):
         self._client_delivered_counts = {
             c: {} for c in range(self.args.client_num_in_total)
         }
+        # How many rounds each client delivered ANYTHING usable, as opposed to
+        # the tier-keyed table above. See _record_delivery for why the two must
+        # not share one table: the tier table is sparse by design under blind
+        # sampling, and reading it as a participation count under-reported
+        # deliveries by roughly half in every blind arm.
+        self._client_delivery_rounds = {
+            c: 0 for c in range(self.args.client_num_in_total)
+        }
         # ASSIGNED tier per client, alongside the DELIVERED counts above. The
         # pair is what makes assignment bias measurable instead of argued: a
         # bandwidth-ranked rule (capacity_rank) gives the well-connected clients
@@ -417,6 +425,14 @@ class FLOFA_Trainer(ABC):
                 self.comm_sim.upload_window(0) if self.comm_sim is not None else None
             ),
             delivered_counts=self._client_delivered_counts,
+            # The coverage selector ranks on how much each client has actually
+            # got through, which is this table and not the tier-keyed one. Wired
+            # 2026-08-10; the archived E6b probes ranked on the sparse tier
+            # table, so a re-run of `--selection_policy coverage` will not
+            # reproduce them. That is a fix, not a regression -- the probes were
+            # optimising a signal that was blind to roughly half the deliveries
+            # -- but it must be stated wherever those numbers are quoted.
+            delivery_rounds=self._client_delivery_rounds,
             last_round_seen=self._client_last_delivery_round,
         )
         chosen = self._selection_policy.select(
@@ -797,20 +813,67 @@ class FLOFA_Trainer(ABC):
         return per_class_acc
 
     def _record_delivery(self, round_num, client_idx, delivered_tier_id):
-        """One client's resolved outcome, for the selection layer's coverage
-        tables and the dead-slot metric (EXPERIMENTS.md measurement rules,
-        2026-07-26). Maintained on EVERY run, not only when a selection policy
-        is active -- the blind baseline's numbers are exactly what the probes
-        are compared against, so they have to be collected the same way.
+        """One client's resolved outcome. Maintained on EVERY run, not only when
+        a selection policy is active -- the blind baseline's numbers are what
+        everything else is compared against, so they must be collected the same
+        way.
 
-        delivered_tier_id: the diverse_subnets key that arrived, or None if the
-        client delivered nothing (a dead slot).
+        TWO QUANTITIES, and conflating them was a real bug (fixed 2026-08-10).
+        Until now this method returned early when ``delivered_tier_id`` was
+        None, so it recorded only deliveries that completed a CONFIGURED ladder
+        tier. Under blind ``TS_all_random`` the middle clients train arbitrary
+        elastic architectures, so their delivered config is some alpha ^ tier_k
+        that matches no configured tier and was silently never counted.
+
+        The size of the error: job 104125 is a 150-round ``nested_blocks`` run
+        at **0% drop**, i.e. every one of its ~60 selections per client
+        delivered something, and the log reported ``coverage_max=29``. Roughly
+        half of all deliveries were invisible, and only in the blind arms --
+        which are exactly the arms every comparison uses as its baseline.
+
+        The two quantities are now kept apart:
+
+        ``_client_delivery_rounds[c]`` -- how many rounds client c delivered
+            ANYTHING usable. This is the participation signal: the dead-slot
+            metric, the selection policies' coverage term, and the delivery
+            probability p the Horvitz-Thompson aggregation weight estimates
+            (comm_sim/aggregation.py). Incremented on every call, because every
+            call site is reached only after the client delivered something.
+
+        ``_client_delivered_counts[c][tier]`` -- how often c completed each
+            LADDER TIER. This is the architecture-coverage signal behind
+            ``[assign_matrix]``. It stays tier-keyed and therefore stays sparse
+            under blind sampling, which is correct for what it measures and is
+            why the two cannot share one table.
+
+        delivered_tier_id: the diverse_subnets key that arrived, or None when
+        the client delivered usable data that completed no configured tier
+        (loose blocks via the collective rule, or a clipped architecture).
         """
+        self._client_delivery_rounds[client_idx] = (
+            self._client_delivery_rounds.get(client_idx, 0) + 1
+        )
+        self._client_last_delivery_round[client_idx] = round_num
         if delivered_tier_id is None:
             return
         counts = self._client_delivered_counts.setdefault(client_idx, {})
         counts[delivered_tier_id] = counts.get(delivered_tier_id, 0) + 1
-        self._client_last_delivery_round[client_idx] = round_num
+
+    def _delivery_rate(self, client_idx):
+        """Estimated P(client delivers | client selected), Laplace-smoothed.
+
+        The denominator is how often the client was SELECTED, not the round
+        count: a client that has never been in a round has no evidence either
+        way, and dividing by rounds would confuse "rarely chosen" with "rarely
+        gets through". comm_sim already tracks the selection counts.
+        """
+        if self.comm_sim is None:
+            return None
+        selected = self.comm_sim.per_client_selected.get(client_idx, 0)
+        if selected <= 0:
+            return None
+        delivered = self._client_delivery_rounds.get(client_idx, 0)
+        return (delivered, selected)
 
     def _log_assignment_matrix(self, round_num):
         """client x tier, assigned and delivered (DIRECTION 3.4, 3.2-pre).
@@ -845,10 +908,18 @@ class FLOFA_Trainer(ABC):
     def _log_selection_metrics(self, round_num, selected, delivered_clients):
         """[selection] round line: dead slots + coverage spread. This is the
         `fig_dead_slots` data and the only visibility into whether a selection
-        policy is actually reclaiming wasted slots or just moving them."""
+        policy is actually reclaiming wasted slots or just moving them.
+
+        coverage_min/max count ROUNDS DELIVERED, not completed tiers. Before
+        2026-08-10 they summed the tier-keyed table, which is sparse under blind
+        sampling -- so a 0%-drop run reported coverage_max=29 against ~60 actual
+        deliveries. Every [selection] line in an archived blind run under-reports
+        for that reason; the drop and dead-slot counts on the same line are
+        unaffected, since they come from `delivered_clients`.
+        """
         dead = [c for c in selected if c not in delivered_clients]
         totals = [
-            sum(self._client_delivered_counts.get(c, {}).values())
+            self._client_delivery_rounds.get(c, 0)
             for c in range(self.args.client_num_in_total)
         ]
         never = sum(1 for t in totals if t == 0)

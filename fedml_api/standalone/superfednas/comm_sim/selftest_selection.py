@@ -182,6 +182,48 @@ def test_is_dead_threshold():
     print("PASS dead-slot threshold matches the smallest tier's payload")
 
 
+def test_coverage_ranks_on_participation_not_tier_matches():
+    """Regression for the delivered-counts undercount (fixed 2026-08-10).
+
+    The coverage objective means "how much has this client actually got
+    through". It used to be read off the TIER-keyed table, which only records
+    deliveries that completed a configured ladder tier -- and under blind
+    TS_all_random a middle client trains an arbitrary elastic architecture that
+    matches no tier, so roughly half of all deliveries were invisible. Job
+    104125 is a 150-round run at 0% drop, ~60 deliveries per client, and its log
+    reported coverage_max=29.
+
+    Client 0 here has delivered in many rounds but completed a tier only once;
+    client 1 is the opposite. A selector ranking on tier matches would call
+    client 0 the starved one and pick it. Ranking on participation must pick
+    client 1.
+    """
+    ctx = sel.SelectionContext(
+        bw_true_bps={0: 50e6, 1: 50e6},
+        upload_window_s=20.0,
+        min_tier_bits=1.0,
+        delivered_counts={0: {"3": 1}, 1: {"0": 40, "1": 40}},
+        delivery_rounds={0: 55, 1: 3},
+        last_round_seen={0: 10, 1: 10},
+    )
+    chosen = sel.CoverageSelector().select(0, [0, 1], 1, ctx)
+    assert chosen == [1], (
+        "coverage selector ranked on tier matches, not participation: %s" % chosen
+    )
+
+    # Without the participation table it falls back to the old behaviour, so an
+    # old caller still runs -- and demonstrably picks the wrong client.
+    old = sel.SelectionContext(
+        bw_true_bps={0: 50e6, 1: 50e6},
+        upload_window_s=20.0,
+        min_tier_bits=1.0,
+        delivered_counts={0: {"3": 1}, 1: {"0": 40, "1": 40}},
+        last_round_seen={0: 10, 1: 10},
+    )
+    assert sel.CoverageSelector().select(0, [0, 1], 1, old) == [0]
+    print("PASS coverage ranks on participation, not on tier matches")
+
+
 if __name__ == "__main__":
     test_cap_max_equals_blind()
     test_cap_below_max_actually_clips()
@@ -190,4 +232,5 @@ if __name__ == "__main__":
     test_coverage_probe_prefers_starved_but_feasible()
     test_coverage_probe_never_returns_short()
     test_is_dead_threshold()
+    test_coverage_ranks_on_participation_not_tier_matches()
     print("ALL PASS")

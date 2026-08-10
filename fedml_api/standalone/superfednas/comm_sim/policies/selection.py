@@ -59,19 +59,27 @@ class SelectionContext:
     min_tier_bits: payload of the smallest tier; a client whose budget is below
         this delivers nothing whatever it is assigned (the "dead slot" test).
     upload_window_s: seconds available for upload.
-    delivered_counts: {client_idx: {tier_id: times this client has delivered at
-        least this tier}} -- the coverage table the fairness probe maximises over.
+    delivered_counts: {client_idx: {tier_id: times this client completed at
+        least this ladder tier}} -- the ARCHITECTURE-coverage table. Sparse by
+        design under blind sampling, because a middle client trains an arbitrary
+        elastic architecture that matches no configured tier.
+    delivery_rounds: {client_idx: rounds in which this client delivered
+        ANYTHING usable} -- the PARTICIPATION table, and the one a coverage
+        objective wants. Kept separate from delivered_counts because reading the
+        tier table as a participation count under-reported deliveries by roughly
+        half in every blind arm (see the trainer's _record_delivery).
     last_round_seen: {client_idx: last round this client delivered anything}.
     """
 
     def __init__(self, bw_true_bps=None, bw_est_bps=None, min_tier_bits=None,
                  upload_window_s=None, delivered_counts=None,
-                 last_round_seen=None):
+                 last_round_seen=None, delivery_rounds=None):
         self.bw_true_bps = bw_true_bps or {}
         self.bw_est_bps = bw_est_bps or {}
         self.min_tier_bits = min_tier_bits
         self.upload_window_s = upload_window_s
         self.delivered_counts = delivered_counts or {}
+        self.delivery_rounds = delivery_rounds or {}
         self.last_round_seen = last_round_seen or {}
 
     def budget_bits(self, client_idx, oracle=True):
@@ -126,6 +134,16 @@ class CoverageSelector(SelectionPolicy):
     """
 
     def _total_delivered(self, ctx, client_idx):
+        """How much this client has actually got through.
+
+        Reads the PARTICIPATION table when the caller supplies one, and falls
+        back to summing the tier-keyed table otherwise. The fallback exists only
+        so an old caller still runs; it is the behaviour the archived E6b probes
+        had, and it under-counts, because the tier table is sparse under blind
+        sampling.
+        """
+        if ctx.delivery_rounds:
+            return ctx.delivery_rounds.get(client_idx, 0)
         return sum(ctx.delivered_counts.get(client_idx, {}).values())
 
     def select(self, round_num, candidates, num_to_select, ctx):
