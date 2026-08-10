@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=analysis_cpu
-#SBATCH --time=03:30:00
+#SBATCH --time=02:00:00
 #SBATCH --account=inforet
 #SBATCH --partition=interactive-cpu
 #SBATCH --gpus=0
@@ -30,7 +30,9 @@
 #    student-cluster1 and 2, so even finding it again is luck.
 #
 # LIMITS of this allocation, so a job is not written that cannot fit:
-#   cpu=2, mem=16G, gpu=0, walltime 4 h on interactive-cpu (3.5 h asked here),
+#   cpu=2, mem=16G, gpu=0, walltime capped at 120 m by the allocation (2 h asked here -- the login
+#   banner states the limit; an earlier version asked 3.5 h and would have been
+#   rejected or truncated),
 #   and a 6000 CPU-minute total budget.
 # Anything needing torch + a GPU model still fits: building supernet subnets to
 # measure payloads is CPU work.
