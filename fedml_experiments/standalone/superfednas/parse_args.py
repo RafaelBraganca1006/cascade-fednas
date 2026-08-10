@@ -677,6 +677,27 @@ def add_args(parser):
         "preserves comparability with all prior results.",
     )
     parser.add_argument(
+        "--aggregation_rule",
+        type=str,
+        default="auto",
+        choices=["auto", "slot", "completeness", "cascade"],
+        help="How a partially delivered update is weighted (DIRECTION 3.3, "
+        "comm_sim/aggregation.py). 'auto' (default) reproduces the existing "
+        "behaviour exactly: 'completeness' when --maxnet_delivery_aware is set, "
+        "'slot' otherwise -- so archived runs stay bit-identical. 'slot' keeps "
+        "the pre-round MaxNet slot weight whatever arrived (the inherited rule; "
+        "vanilla SuperFedNAS never reaches the case, because without truncation "
+        "the max slot always delivers in full). 'completeness' scales that "
+        "weight by delivered/intended bits. 'cascade' derives the weight from "
+        "the tier that ARRIVED rather than the slot that was assigned, then "
+        "modulates it by observed state -- how starved the refreshed region is, "
+        "and how rarely this client gets through (a Horvitz-Thompson stand-in "
+        "for the deliveries the channel destroyed) -- and renormalises to the "
+        "round's mass. Measured motivation: switching between the first two is "
+        "worth +2.15 spread at the canonical config (104232 vs 104125), so the "
+        "aggregation axis has more room than any policy tested here.",
+    )
+    parser.add_argument(
         "--nested_context_ablation",
         action="store_true",
         help="E3 gradient-context ablation (DIRECTION §3.1a). nested/nested_shard "

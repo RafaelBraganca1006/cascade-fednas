@@ -192,6 +192,20 @@ class FLOFA_Trainer(ABC):
         self._client_delivery_rounds = {
             c: 0 for c in range(self.args.client_num_in_total)
         }
+        # Aggregation rule (DIRECTION 3.3). Resolved once so the per-round code
+        # is a lookup. The DEFAULT reproduces the existing behaviour exactly --
+        # completeness scaling when --maxnet_delivery_aware is set, the
+        # inherited slot weight otherwise -- so every archived run stays
+        # bit-identical and only --aggregation_rule cascade changes anything.
+        self._shell_coverage = {}
+        self._agg_rule = getattr(self.args, "aggregation_rule", "auto")
+        if self._agg_rule == "auto":
+            self._agg_rule = (
+                "completeness"
+                if getattr(self.args, "maxnet_delivery_aware", False)
+                else "slot"
+            )
+        logging.info("[aggregation] rule = %s" % self._agg_rule)
         # ASSIGNED tier per client, alongside the DELIVERED counts above. The
         # pair is what makes assignment bias measurable instead of argued: a
         # bandwidth-ranked rule (capacity_rank) gives the well-connected clients
@@ -859,6 +873,109 @@ class FLOFA_Trainer(ABC):
         counts = self._client_delivered_counts.setdefault(client_idx, {})
         counts[delivered_tier_id] = counts.get(delivered_tier_id, 0) + 1
 
+    def _recent_shell_coverage(self, window=20):
+        """{shell: mean fraction of that shell's units that arrived} over the
+        last `window` completed rounds.
+
+        A window rather than the whole run: the quantity the weight wants is
+        "is this region starved RIGHT NOW", and a lifetime average stops moving
+        after a hundred rounds. Empty before the first round completes, which
+        makes the coverage factor a no-op then -- correct, since there is no
+        evidence yet.
+        """
+        if self.comm_sim is None:
+            return {}
+        arrived, total = {}, {}
+        for rec in self.comm_sim.round_records[-window:]:
+            for shell, n in rec.get("shell_total", {}).items():
+                total[shell] = total.get(shell, 0) + n
+            for shell, n in rec.get("shell_arrived", {}).items():
+                arrived[shell] = arrived.get(shell, 0) + n
+        return {
+            s: arrived.get(s, 0) / float(t) for s, t in total.items() if t
+        }
+
+    def _make_delivery(self, idx, client_idx, slot_weight, tx_report,
+                       completeness):
+        """One client's post-transmission record for the CASCADE weight rule.
+
+        Everything here is observed AFTER the deadline, which is the whole point
+        of the rule: MaxNet weights from a calendar fixed before the run, and
+        what actually arrived is a strictly better signal available for free at
+        aggregation time.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.aggregation import Delivery
+
+        num_tiers = len(self.args.diverse_subnets)
+        delivered_tier = -1
+        if tx_report is not None and tx_report.delivered_tier is not None:
+            delivered_tier = tx_report.delivered_tier
+        elif tx_report is None:
+            # comm_sim off: nothing was truncated, so the client delivered
+            # whatever it was assigned, in full.
+            delivered_tier = num_tiers - 1
+
+        # Coverage of the region this delivery refreshed, from the shell
+        # counters comm_sim already maintains. That table is the RELIABLE one:
+        # unlike the tier-keyed delivery counts it is complete under blind
+        # sampling, because it counts UNITS rather than architecture matches.
+        #
+        # It is read from COMPLETED rounds only. Reading the round in progress
+        # would give each client a different view -- the accumulator holds just
+        # the clients processed so far -- so the first client of a round would
+        # see near-zero coverage and the last would see the full round. The
+        # weight would then depend on position in the loop, which is arbitrary.
+        coverage = None
+        if delivered_tier >= 0:
+            coverage = self._shell_coverage.get(delivered_tier)
+
+        rate = self._delivery_rate(client_idx)
+        return Delivery(
+            client_idx=client_idx,
+            slot_weight=slot_weight,
+            delivered_tier=delivered_tier,
+            num_tiers=num_tiers,
+            completeness=completeness,
+            region_coverage=coverage,
+            delivery_count=rate[0] if rate else None,
+            round_count=rate[1] if rate else None,
+        )
+
+    def _apply_cascade_weights(self, round_num, w_locals, w_local_owner,
+                               round_deliveries):
+        """Re-weight the round's contributions with the CASCADE rule.
+
+        Applied after the client loop because the rule is a function of the
+        ROUND, not of one client: it splits the max-slot budget among whoever
+        delivered the top tier and normalises to the round's mass. Both are
+        impossible to compute while the loop is still running.
+
+        Each of a client's entries receives that client's full weight. The block
+        stream's two entries are disjoint by construction (the prefix excludes
+        the leftover blocks), so a coordinate is still counted exactly once.
+        """
+        from fedml_api.standalone.superfednas.comm_sim.aggregation import (
+            cascade_weights,
+        )
+
+        if not round_deliveries or not w_locals:
+            return
+        weights = cascade_weights(round_deliveries)
+        by_client = {
+            d.client_idx: w for d, w in zip(round_deliveries, weights)
+        }
+        for entry, owner in zip(w_locals, w_local_owner):
+            if owner in by_client:
+                entry.set_avg_wt(by_client[owner])
+        if self.args.verbose:
+            logging.info(
+                "[aggregation] round %d cascade: %d contributors, mass %.4f "
+                "(slot mass %.4f), max weight %.4f"
+                % (round_num, len(weights), sum(weights),
+                   sum(d.slot_weight for d in round_deliveries),
+                   max(weights) if weights else 0.0)
+            )
+
     def _delivery_rate(self, client_idx):
         """Estimated P(client delivers | client selected), Laplace-smoothed.
 
@@ -1173,6 +1290,11 @@ class FLOFA_Trainer(ABC):
         self.server_model.update_sample()
         avg_weights = self.weighted_avg_scheduler[self.wt_avg_sched_method](round_num)
         w_locals = []
+        # CASCADE aggregation: one Delivery record per contributing client, plus
+        # the owner of each w_locals entry (the block stream emits up to two
+        # disjoint entries for one client, and both carry that client's weight).
+        round_deliveries = []
+        w_local_owner = []
         avg_gflops = 0
         avg_params = 0
         training_samples = []
@@ -1187,6 +1309,9 @@ class FLOFA_Trainer(ABC):
             policy_tier_counts = {tid: 0 for tid in self.args.diverse_subnets}
         if self.comm_sim is not None:
             self.comm_sim.start_round(round_num)
+        # Per-shell coverage over the recent COMPLETED rounds, computed once so
+        # every client in this round sees the same picture (see _make_delivery).
+        self._shell_coverage = self._recent_shell_coverage()
         # nested_shard: designate carriers that train the full supernet and
         # upload assigned shard units of the starving region (collective upload)
         shard_assignment = {}
@@ -1283,10 +1408,14 @@ class FLOFA_Trainer(ABC):
                     if not delivered_units:
                         continue  # nothing fits: not trained, not aggregated
                     delivered_clients.add(client_idx)
-                    self._record_delivery(
-                        round_num, client_idx,
-                        self._tier_id_for_config(client_model.model_config),
-                    )
+                    # A carrier uploads loose shard units, never a complete
+                    # tier, so no tier's coverage is refreshed -- exactly like
+                    # the sub-floor fallback below. Passing the ASSIGNED config
+                    # here (which was overridden to the max subnet for carriers)
+                    # recorded a full max-tier delivery that never happened.
+                    # Fixed 2026-08-10; affects the nested_shard mode only,
+                    # which is superseded by the block stream.
+                    self._record_delivery(round_num, client_idx, None)
                 elif self.comm_sim.tx_mode == "nested_blocks":
                     # DIRECTION §3.1c: one block-granular stream, cut anywhere,
                     # classified ex-post. Unlike the shell path a client whose
@@ -1507,6 +1636,18 @@ class FLOFA_Trainer(ABC):
                 # (v2_arm_b_nested_baseline.out etc.) stays reproducible.
                 maxnet_weight *= delivery_completeness
             client_model.set_avg_wt(maxnet_weight)
+            # CASCADE aggregation (DIRECTION 3.3, comm_sim/aggregation.py) needs
+            # the WHOLE round before it can weight anything, because it
+            # normalises to the round's mass and splits the max-slot budget
+            # among whoever actually delivered the top tier. So the record is
+            # collected here and the weights are applied after the loop, just
+            # before _aggregate. avg_weight is only read at aggregation time, so
+            # re-assigning it later changes nothing about training.
+            if self._agg_rule == "cascade":
+                round_deliveries.append(self._make_delivery(
+                    idx, client_idx, avg_weights[idx], tx_report,
+                    delivery_completeness,
+                ))
             cur_model_vec = None
             self.client_trainer.set_model(client_model)
             self.client_trainer.set_alpha(self.weighted_feddyn_alpha[client_idx])
@@ -1575,6 +1716,7 @@ class FLOFA_Trainer(ABC):
                         % (role, client_idx, len(delivered_units))
                     )
                 w_locals.append(ShardedUpdate(updated_cli_model, delivered_units))
+                w_local_owner.append(client_idx)
                 continue
             # block stream: up to TWO disjoint updates from the same client --
             # the complete shell prefix as a tier-k subnet, plus the blocks that
@@ -1590,6 +1732,7 @@ class FLOFA_Trainer(ABC):
                 for part in parts:
                     part.set_avg_wt(maxnet_weight)
                 w_locals.extend(parts)
+                w_local_owner.extend([client_idx] * len(parts))
                 if self.args.verbose and tx_report.leftover_blocks:
                     logging.info(
                         "[comm_sim] client %d stream: tier %d prefix + %d "
@@ -1625,6 +1768,11 @@ class FLOFA_Trainer(ABC):
                     updated_cli_model, tx_report.delivered_config
                 )
             w_locals.append(updated_cli_model)
+            w_local_owner.append(client_idx)
+        if self._agg_rule == "cascade":
+            self._apply_cascade_weights(
+                round_num, w_locals, w_local_owner, round_deliveries
+            )
         # Multiply weight with dataset size proportion to global dataset size
         # (len(w_locals) may be < client_num_per_round once comm_sim drops updates)
         if self.args.weight_dataset:
