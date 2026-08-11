@@ -1312,6 +1312,11 @@ class FLOFA_Trainer(ABC):
         # disjoint entries for one client, and both carry that client's weight).
         round_deliveries = []
         w_local_owner = []
+        # Observability for the CASCADE correction. Without it a 9-hour run
+        # finishes and an inert correction is indistinguishable from a working
+        # one -- the silent-failure class this project keeps paying for. Records
+        # (region, pi_hat) for every part the correction touches.
+        self._cascade_stats = []
         avg_gflops = 0
         avg_params = 0
         training_samples = []
@@ -1750,6 +1755,9 @@ class FLOFA_Trainer(ABC):
                 for part, region in parts:
                     w = maxnet_weight
                     if self._agg_rule == "cascade" and region is not None:
+                        self._cascade_stats.append(
+                            (region, self._coverage_freq(client_idx, region))
+                        )
                         # CASCADE (DIRECTION 3.3c): this part is a contribution
                         # to region `region`, which this client reaches only
                         # pi_hat of the time. Weighting by 1/pi_hat cancels the
@@ -1801,6 +1809,24 @@ class FLOFA_Trainer(ABC):
                 )
             w_locals.append(updated_cli_model)
             w_local_owner.append(client_idx)
+        if self._agg_rule == "cascade" and self._cascade_stats:
+            from fedml_api.standalone.superfednas.comm_sim.aggregation import (
+                inverse_frequency_correction,
+            )
+
+            by_region = {}
+            for reg, freq in self._cascade_stats:
+                by_region.setdefault(reg, []).append(
+                    inverse_frequency_correction(freq)
+                )
+            logging.info(
+                "[cascade] round %d: %d parts corrected | %s"
+                % (round_num, len(self._cascade_stats),
+                   " ".join(
+                       "s%d n=%d x%.2f-%.2f" % (
+                           r, len(v), min(v), max(v))
+                       for r, v in sorted(by_region.items())))
+            )
         if (self._agg_rule == "cascade" and self.comm_sim is not None
                 and self.comm_sim.tx_mode != "nested_blocks"):
             # The block stream already weighted each emitted part by the region
