@@ -48,6 +48,7 @@
 #
 # Usage (from the dynfednas_v2 repo root):
 #   sbatch cluster/run_selection_probe.sbatch <SELECTION> [ROUNDS] [CORR] [DEADLINE] [ALPHA] [JITTER]
+#      ... [TXMODE] [MAXNETFIX] [BLOCKORDER] [EVALFREQ] [PIVOT] [SAMPLER] [MODEL] [DARTS_C] [DARTS_LAYERS] [BATCH] [AGGRULE] [SEED]
 #
 #   sbatch cluster/run_selection_probe.sbatch none              # blind, the bar
 #   sbatch cluster/run_selection_probe.sbatch oracle_bandwidth  # probe A
@@ -153,6 +154,25 @@ DARTS_LAYERS="${15:-20}"
 # difference does not touch it; state it in the text.
 BATCH="${16:-64}"
 
+# Aggregation rule (DIRECTION 3.3c). `auto` reproduces the historical behaviour
+# exactly -- completeness scaling when MAXNETFIX=on, the inherited slot weight
+# otherwise -- so every archived invocation is unaffected. `cascade` weights each
+# emitted part by the inverse frequency with which THAT client reaches THAT
+# region, and the trainer refuses it on any mode other than nested_blocks,
+# because only the block stream emits parts that map to regions.
+AGGRULE="${17:-auto}"
+
+# Seed. Sets BOTH the weight init and the bandwidth chain, so a seed is a whole
+# alternative world. Arms compared within one seed therefore share a bandwidth
+# trace, which is what makes them paired -- E1's rule, "same bandwidth seeds
+# across methods".
+#
+# Worth knowing before reading small differences: cudnn determinism is disabled
+# on this path (train.py:522 is commented out), so two runs with the SAME seed
+# still diverge. Measured on an accidental replicate pair: 0.64 on mean accuracy
+# and 1.44 on spread by round 149. Nothing below that is a result without seeds.
+SEED="${18:-0}"
+
 # The DARTS baseline has ONE architecture, so the supernet machinery has to be
 # switched off for it: TS_all_random calls get_subnet(**arch_config) and
 # ServerDarts returns a Genotype, not a mapping (that is the crash), and
@@ -178,14 +198,14 @@ fi
 if [ "$TXMODE" = "none" ]; then
   COMM_FLAGS=""
 else
-  COMM_FLAGS="--comm_sim --bw_deadline $DEADLINE --bw_seed 0 --tx_mode $TXMODE"
+  COMM_FLAGS="--comm_sim --bw_deadline $DEADLINE --bw_seed $SEED --tx_mode $TXMODE"
   COMM_FLAGS="$COMM_FLAGS --bw_profile tiered_continuous --bw_jitter_sigma $JITTER"
   COMM_FLAGS="$COMM_FLAGS --bw_data_corr $CORR --bw_estimate lagged"
   if [ "$MAXNETFIX" = "on" ]; then
     COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
   fi
 fi
-RUN_NAME="e6b_${MODEL:0:6}_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}"
+RUN_NAME="e6b_${MODEL:0:6}_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_agg${AGGRULE}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}_s${SEED}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
@@ -198,7 +218,8 @@ python train.py \
   --subnet_dist_type "$SAMPLER" \
   --diverse_subnets "$SUBNETS" \
   $SCHED_FLAG \
-  --frequency_of_the_test "$EVALFREQ" --partition_alpha "$ALPHA" --init_seed 0 \
+  --frequency_of_the_test "$EVALFREQ" --partition_alpha "$ALPHA" --init_seed "$SEED" \
+  --aggregation_rule "$AGGRULE" \
   --efficient_test --verbose --log_per_class --log_inclusion_gap \
   --block_order "$BLOCKORDER" --stream_pivot "$PIVOT" \
   $COMM_FLAGS \
