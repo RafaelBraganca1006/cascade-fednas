@@ -192,12 +192,20 @@ class FLOFA_Trainer(ABC):
         self._client_delivery_rounds = {
             c: 0 for c in range(self.args.client_num_in_total)
         }
+        # pi_hat(i, s): how often client i's contribution reaches supernet region
+        # s. This is the quantity the CASCADE aggregation weight inverts
+        # (DIRECTION 3.3c). Per (client, shell) rather than per client, because
+        # under the block stream the drop rate is 0% -- the client marginal is 1
+        # for everybody and carries no signal, while the region marginal spans
+        # 0.759 to 0.165 at the canonical config.
+        self._client_shell_deliveries = {
+            c: {} for c in range(self.args.client_num_in_total)
+        }
         # Aggregation rule (DIRECTION 3.3). Resolved once so the per-round code
         # is a lookup. The DEFAULT reproduces the existing behaviour exactly --
         # completeness scaling when --maxnet_delivery_aware is set, the
         # inherited slot weight otherwise -- so every archived run stays
         # bit-identical and only --aggregation_rule cascade changes anything.
-        self._shell_coverage = {}
         self._agg_rule = getattr(self.args, "aggregation_rule", "auto")
         if self._agg_rule == "auto":
             self._agg_rule = (
@@ -206,6 +214,21 @@ class FLOFA_Trainer(ABC):
                 else "slot"
             )
         logging.info("[aggregation] rule = %s" % self._agg_rule)
+        if self._agg_rule == "cascade":
+            mode = getattr(self.args, "tx_mode", "all_or_nothing")
+            if not getattr(self.args, "comm_sim", False) or mode != "nested_blocks":
+                raise RuntimeError(
+                    "--aggregation_rule cascade requires --comm_sim with "
+                    "--tx_mode nested_blocks. The correction is PER REGION, and "
+                    "only the block stream emits a client's update as separate "
+                    "parts that map to regions. On the other paths a client "
+                    "contributes one undifferentiated update, so the only "
+                    "available weight is a single scalar indexed by the deepest "
+                    "region that client reached -- which is ~1 by construction "
+                    "(a client that habitually reaches region k reaches it "
+                    "almost always) and therefore inert. Refusing here rather "
+                    "than silently running a no-op arm; see DIRECTION 3.3c."
+                )
         # ASSIGNED tier per client, alongside the DELIVERED counts above. The
         # pair is what makes assignment bias measurable instead of argued: a
         # bandwidth-ranked rule (capacity_rank) gives the well-connected clients
@@ -558,6 +581,12 @@ class FLOFA_Trainer(ABC):
         update minus the blocks that outran it, plus those blocks at their own
         width. When nothing outran the prefix this is exactly one plain sliced
         model -- byte-identical to what the frozen `nested` path emits.
+
+        Returns (part, region) pairs. The region is what the CASCADE weight
+        needs: the prefix covers the common core, which every client reaches, so
+        it carries no correction (region None); a leftover group at level j is a
+        contribution to region j specifically, and j is where the scarcity --
+        and therefore the correction -- lives.
         """
         from fedml_api.standalone.superfednas.comm_sim.sharding import ShardedUpdate
 
@@ -614,7 +643,7 @@ class FLOFA_Trainer(ABC):
                     sliced, None, exclude_block_ids=prefix_exclude,
                     include_other=True,
                 )
-            updates.append(sliced)
+            updates.append((sliced, None))
         # blocks that got further than the prefix, grouped by the width reached
         by_level = {}
         for block, level in leftover.items():
@@ -626,7 +655,7 @@ class FLOFA_Trainer(ABC):
             # never had
             sliced = self._slice_client_update(trained_model, plan.tier_configs[level])
             updates.append(
-                ShardedUpdate(sliced, blocks, include_other=False)
+                (ShardedUpdate(sliced, blocks, include_other=False), level)
             )
         return updates
 
@@ -873,28 +902,6 @@ class FLOFA_Trainer(ABC):
         counts = self._client_delivered_counts.setdefault(client_idx, {})
         counts[delivered_tier_id] = counts.get(delivered_tier_id, 0) + 1
 
-    def _recent_shell_coverage(self, window=20):
-        """{shell: mean fraction of that shell's units that arrived} over the
-        last `window` completed rounds.
-
-        A window rather than the whole run: the quantity the weight wants is
-        "is this region starved RIGHT NOW", and a lifetime average stops moving
-        after a hundred rounds. Empty before the first round completes, which
-        makes the coverage factor a no-op then -- correct, since there is no
-        evidence yet.
-        """
-        if self.comm_sim is None:
-            return {}
-        arrived, total = {}, {}
-        for rec in self.comm_sim.round_records[-window:]:
-            for shell, n in rec.get("shell_total", {}).items():
-                total[shell] = total.get(shell, 0) + n
-            for shell, n in rec.get("shell_arrived", {}).items():
-                arrived[shell] = arrived.get(shell, 0) + n
-        return {
-            s: arrived.get(s, 0) / float(t) for s, t in total.items() if t
-        }
-
     def _make_delivery(self, idx, client_idx, slot_weight, tx_report,
                        completeness):
         """One client's post-transmission record for the CASCADE weight rule.
@@ -915,30 +922,19 @@ class FLOFA_Trainer(ABC):
             # whatever it was assigned, in full.
             delivered_tier = num_tiers - 1
 
-        # Coverage of the region this delivery refreshed, from the shell
-        # counters comm_sim already maintains. That table is the RELIABLE one:
-        # unlike the tier-keyed delivery counts it is complete under blind
-        # sampling, because it counts UNITS rather than architecture matches.
-        #
-        # It is read from COMPLETED rounds only. Reading the round in progress
-        # would give each client a different view -- the accumulator holds just
-        # the clients processed so far -- so the first client of a round would
-        # see near-zero coverage and the last would see the full round. The
-        # weight would then depend on position in the loop, which is arbitrary.
-        coverage = None
-        if delivered_tier >= 0:
-            coverage = self._shell_coverage.get(delivered_tier)
+        # pi_hat(i, s) for the region this delivery refreshed. The outermost
+        # region reached is the one whose coverage is scarcest and the one the
+        # correction is about, so the delivered tier indexes it.
+        self._record_shell_reach(client_idx, tx_report, delivered_tier)
+        coverage_freq = self._coverage_freq(client_idx, delivered_tier)
 
-        rate = self._delivery_rate(client_idx)
         return Delivery(
             client_idx=client_idx,
             slot_weight=slot_weight,
             delivered_tier=delivered_tier,
             num_tiers=num_tiers,
             completeness=completeness,
-            region_coverage=coverage,
-            delivery_count=rate[0] if rate else None,
-            round_count=rate[1] if rate else None,
+            coverage_freq=coverage_freq,
         )
 
     def _apply_cascade_weights(self, round_num, w_locals, w_local_owner,
@@ -976,21 +972,42 @@ class FLOFA_Trainer(ABC):
                    max(weights) if weights else 0.0)
             )
 
-    def _delivery_rate(self, client_idx):
-        """Estimated P(client delivers | client selected), Laplace-smoothed.
+    def _record_shell_reach(self, client_idx, report, delivered_tier):
+        """Note which regions this client's contribution reached this round.
 
-        The denominator is how often the client was SELECTED, not the round
-        count: a client that has never been in a round has no evidence either
-        way, and dividing by rounds would confuse "rarely chosen" with "rarely
-        gets through". comm_sim already tracks the selection counts.
+        A region counts as reached when any of its units arrived from this
+        client. The block stream reports that directly; the shell path delivers
+        a shell whole or not at all, so everything up to the delivered tier was
+        reached.
         """
-        if self.comm_sim is None:
+        reached = set()
+        arrived = getattr(report, "shell_units_arrived", None) if report else None
+        if arrived:
+            reached = {s for s, n in arrived.items() if n > 0}
+        elif delivered_tier is not None and delivered_tier >= 0:
+            reached = set(range(delivered_tier + 1))
+        table = self._client_shell_deliveries.setdefault(client_idx, {})
+        for s in reached:
+            table[s] = table.get(s, 0) + 1
+
+    def _coverage_freq(self, client_idx, shell):
+        """Laplace-smoothed estimate of pi(i, s).
+
+        Denominator is how often the client was SELECTED, not the round count:
+        a client rarely chosen has little evidence either way, and dividing by
+        rounds would confuse "rarely chosen" with "rarely gets through".
+        Smoothing keeps a never-reached region at a large but finite correction
+        instead of a division by zero, which is the bias-variance control FedAU
+        applies with its interval cutoff.
+        """
+        if self.comm_sim is None or shell is None or shell < 0:
             return None
         selected = self.comm_sim.per_client_selected.get(client_idx, 0)
         if selected <= 0:
             return None
-        delivered = self._client_delivery_rounds.get(client_idx, 0)
-        return (delivered, selected)
+        hits = self._client_shell_deliveries.get(client_idx, {}).get(shell, 0)
+        lap = 1.0
+        return (hits + lap) / (float(selected) + lap)
 
     def _log_assignment_matrix(self, round_num):
         """client x tier, assigned and delivered (DIRECTION 3.4, 3.2-pre).
@@ -1309,9 +1326,6 @@ class FLOFA_Trainer(ABC):
             policy_tier_counts = {tid: 0 for tid in self.args.diverse_subnets}
         if self.comm_sim is not None:
             self.comm_sim.start_round(round_num)
-        # Per-shell coverage over the recent COMPLETED rounds, computed once so
-        # every client in this round sees the same picture (see _make_delivery).
-        self._shell_coverage = self._recent_shell_coverage()
         # nested_shard: designate carriers that train the full supernet and
         # upload assigned shard units of the starving region (collective upload)
         shard_assignment = {}
@@ -1726,12 +1740,30 @@ class FLOFA_Trainer(ABC):
                 and self.comm_sim.tx_mode == "nested_blocks"
                 and tx_report is not None
             ):
+                from fedml_api.standalone.superfednas.comm_sim.aggregation import (
+                    inverse_frequency_correction,
+                )
+
                 parts = self._stream_updates(
                     updated_cli_model, tx_report, stream_plan
                 )
-                for part in parts:
-                    part.set_avg_wt(maxnet_weight)
-                w_locals.extend(parts)
+                for part, region in parts:
+                    w = maxnet_weight
+                    if self._agg_rule == "cascade" and region is not None:
+                        # CASCADE (DIRECTION 3.3c): this part is a contribution
+                        # to region `region`, which this client reaches only
+                        # pi_hat of the time. Weighting by 1/pi_hat cancels the
+                        # bias toward the clients that reach it often. The
+                        # prefix (region None) is left alone -- every client
+                        # reaches the core, so there is no bias there to remove,
+                        # and correcting it would raise the well-connected
+                        # clients' influence on exactly the shared weights this
+                        # correction exists to protect.
+                        w *= inverse_frequency_correction(
+                            self._coverage_freq(client_idx, region)
+                        )
+                    part.set_avg_wt(w)
+                w_locals.extend([p for p, _ in parts])
                 w_local_owner.extend([client_idx] * len(parts))
                 if self.args.verbose and tx_report.leftover_blocks:
                     logging.info(
@@ -1769,7 +1801,13 @@ class FLOFA_Trainer(ABC):
                 )
             w_locals.append(updated_cli_model)
             w_local_owner.append(client_idx)
-        if self._agg_rule == "cascade":
+        if (self._agg_rule == "cascade" and self.comm_sim is not None
+                and self.comm_sim.tx_mode != "nested_blocks"):
+            # The block stream already weighted each emitted part by the region
+            # it covers, inside the loop. Running the per-client rule here would
+            # overwrite those with one scalar per client, which is precisely the
+            # inert-and-then-harmful behaviour that per-region weighting exists
+            # to replace.
             self._apply_cascade_weights(
                 round_num, w_locals, w_local_owner, round_deliveries
             )
