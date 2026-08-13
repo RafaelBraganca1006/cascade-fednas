@@ -184,7 +184,15 @@ def test_unbiasedness_in_simulation():
 
 
 def test_completeness_rule_is_unchanged():
-    """The shipped rule must behave exactly as the archived runs saw it."""
+    """The reference `completeness` rule, pinned.
+
+    SCOPE, because the name overpromises: this pins the rule as expressed in
+    aggregation.py, NOT the line the trainer executes
+    (`maxnet_weight *= delivery_completeness`). The two are separate expressions
+    of the same idea, so editing the trainer would leave this test green. Only
+    the correction is covered end to end, because it is the one function the
+    production path calls.
+    """
     d = make_round(tiers=[3] + [1] * 7, completeness=[0.5] + [1.0] * 7)
     w = completeness_weights(d)
     assert approx(w[0], 0.9 * 0.5), "max slot should be halved"

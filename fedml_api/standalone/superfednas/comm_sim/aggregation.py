@@ -1,5 +1,30 @@
 """Aggregation weights under partial delivery -- DIRECTION.md 3.3c, "door two".
 
+WHAT IN HERE ACTUALLY RUNS -- READ THIS BEFORE TRUSTING A TEST
+==============================================================
+Only ``inverse_frequency_correction`` is on the production path. The trainer
+calls it per emitted part; nothing else in this module is reached at run time.
+
+``Delivery``, ``slot_weights``, ``completeness_weights`` and ``cascade_weights``
+are a REFERENCE implementation, exercised by selftest_aggregation.py and used to
+state the three rules side by side so they can be compared rather than argued
+about. They are not what the trainer executes.
+
+That distinction matters because it limits what the self-tests prove. The
+shipped `completeness` rule is the line
+
+    maxnet_weight *= delivery_completeness
+
+in superfednas_trainer.py, and ``completeness_weights`` below is a second
+expression of the same idea. A test over this module therefore does NOT protect
+that line: changing the trainer would leave the suite green. The tests are real
+for the correction (the live function) and are documentation for the rest.
+
+Closing that gap means routing the trainer through this module for all three
+rules. That is the right fix and it is deliberately not done yet: it edits the
+weight that produced every archived number, and the seed campaign is running.
+Recorded here rather than left to be rediscovered.
+
 WHY THIS IS A MODULE AND NOT A LINE IN THE TRAINER
 ==================================================
 The rule used to be two lines inside a 600-line training loop, which made it
@@ -119,14 +144,6 @@ class Delivery(object):
         self.num_tiers = int(num_tiers)
         self.completeness = float(completeness)
         self.coverage_freq = coverage_freq
-
-    @property
-    def delivered_max(self):
-        return self.delivered_tier == self.num_tiers - 1
-
-    @property
-    def complete(self):
-        return self.completeness >= 1.0 - 1e-9
 
 
 def _renormalise(weights, target_mass):
