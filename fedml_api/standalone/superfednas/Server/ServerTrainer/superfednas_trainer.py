@@ -902,76 +902,6 @@ class FLOFA_Trainer(ABC):
         counts = self._client_delivered_counts.setdefault(client_idx, {})
         counts[delivered_tier_id] = counts.get(delivered_tier_id, 0) + 1
 
-    def _make_delivery(self, idx, client_idx, slot_weight, tx_report,
-                       completeness):
-        """One client's post-transmission record for the CASCADE weight rule.
-
-        Everything here is observed AFTER the deadline, which is the whole point
-        of the rule: MaxNet weights from a calendar fixed before the run, and
-        what actually arrived is a strictly better signal available for free at
-        aggregation time.
-        """
-        from fedml_api.standalone.superfednas.comm_sim.aggregation import Delivery
-
-        num_tiers = len(self.args.diverse_subnets)
-        delivered_tier = -1
-        if tx_report is not None and tx_report.delivered_tier is not None:
-            delivered_tier = tx_report.delivered_tier
-        elif tx_report is None:
-            # comm_sim off: nothing was truncated, so the client delivered
-            # whatever it was assigned, in full.
-            delivered_tier = num_tiers - 1
-
-        # pi_hat(i, s) for the region this delivery refreshed. The outermost
-        # region reached is the one whose coverage is scarcest and the one the
-        # correction is about, so the delivered tier indexes it.
-        self._record_shell_reach(client_idx, tx_report, delivered_tier)
-        coverage_freq = self._coverage_freq(client_idx, delivered_tier)
-
-        return Delivery(
-            client_idx=client_idx,
-            slot_weight=slot_weight,
-            delivered_tier=delivered_tier,
-            num_tiers=num_tiers,
-            completeness=completeness,
-            coverage_freq=coverage_freq,
-        )
-
-    def _apply_cascade_weights(self, round_num, w_locals, w_local_owner,
-                               round_deliveries):
-        """Re-weight the round's contributions with the CASCADE rule.
-
-        Applied after the client loop because the rule is a function of the
-        ROUND, not of one client: it splits the max-slot budget among whoever
-        delivered the top tier and normalises to the round's mass. Both are
-        impossible to compute while the loop is still running.
-
-        Each of a client's entries receives that client's full weight. The block
-        stream's two entries are disjoint by construction (the prefix excludes
-        the leftover blocks), so a coordinate is still counted exactly once.
-        """
-        from fedml_api.standalone.superfednas.comm_sim.aggregation import (
-            cascade_weights,
-        )
-
-        if not round_deliveries or not w_locals:
-            return
-        weights = cascade_weights(round_deliveries)
-        by_client = {
-            d.client_idx: w for d, w in zip(round_deliveries, weights)
-        }
-        for entry, owner in zip(w_locals, w_local_owner):
-            if owner in by_client:
-                entry.set_avg_wt(by_client[owner])
-        if self.args.verbose:
-            logging.info(
-                "[aggregation] round %d cascade: %d contributors, mass %.4f "
-                "(slot mass %.4f), max weight %.4f"
-                % (round_num, len(weights), sum(weights),
-                   sum(d.slot_weight for d in round_deliveries),
-                   max(weights) if weights else 0.0)
-            )
-
     def _record_shell_reach(self, client_idx, report, delivered_tier):
         """Note which regions this client's contribution reached this round.
 
@@ -1307,11 +1237,6 @@ class FLOFA_Trainer(ABC):
         self.server_model.update_sample()
         avg_weights = self.weighted_avg_scheduler[self.wt_avg_sched_method](round_num)
         w_locals = []
-        # CASCADE aggregation: one Delivery record per contributing client, plus
-        # the owner of each w_locals entry (the block stream emits up to two
-        # disjoint entries for one client, and both carry that client's weight).
-        round_deliveries = []
-        w_local_owner = []
         # Observability for the CASCADE correction. Without it a 9-hour run
         # finishes and an inert correction is indistinguishable from a working
         # one -- the silent-failure class this project keeps paying for. Records
@@ -1662,11 +1587,6 @@ class FLOFA_Trainer(ABC):
             # collected here and the weights are applied after the loop, just
             # before _aggregate. avg_weight is only read at aggregation time, so
             # re-assigning it later changes nothing about training.
-            if self._agg_rule == "cascade":
-                round_deliveries.append(self._make_delivery(
-                    idx, client_idx, avg_weights[idx], tx_report,
-                    delivery_completeness,
-                ))
             cur_model_vec = None
             self.client_trainer.set_model(client_model)
             self.client_trainer.set_alpha(self.weighted_feddyn_alpha[client_idx])
@@ -1735,7 +1655,6 @@ class FLOFA_Trainer(ABC):
                         % (role, client_idx, len(delivered_units))
                     )
                 w_locals.append(ShardedUpdate(updated_cli_model, delivered_units))
-                w_local_owner.append(client_idx)
                 continue
             # block stream: up to TWO disjoint updates from the same client --
             # the complete shell prefix as a tier-k subnet, plus the blocks that
@@ -1772,7 +1691,16 @@ class FLOFA_Trainer(ABC):
                         )
                     part.set_avg_wt(w)
                 w_locals.extend([p for p, _ in parts])
-                w_local_owner.extend([client_idx] * len(parts))
+                if self._agg_rule == "cascade":
+                    # Update pi_hat AFTER the weights above were computed, so a
+                    # delivery is never counted in the estimate of its own
+                    # probability. Explicit call site on purpose: this used to
+                    # be a side effect of a function whose return value was
+                    # discarded, which meant deleting the apparently-dead call
+                    # would have silently frozen the estimator.
+                    self._record_shell_reach(
+                        client_idx, tx_report, tx_report.delivered_tier
+                    )
                 if self.args.verbose and tx_report.leftover_blocks:
                     logging.info(
                         "[comm_sim] client %d stream: tier %d prefix + %d "
@@ -1808,7 +1736,6 @@ class FLOFA_Trainer(ABC):
                     updated_cli_model, tx_report.delivered_config
                 )
             w_locals.append(updated_cli_model)
-            w_local_owner.append(client_idx)
         if self._agg_rule == "cascade" and self._cascade_stats:
             from fedml_api.standalone.superfednas.comm_sim.aggregation import (
                 inverse_frequency_correction,
@@ -1826,16 +1753,6 @@ class FLOFA_Trainer(ABC):
                        "s%d n=%d x%.2f-%.2f" % (
                            r, len(v), min(v), max(v))
                        for r, v in sorted(by_region.items())))
-            )
-        if (self._agg_rule == "cascade" and self.comm_sim is not None
-                and self.comm_sim.tx_mode != "nested_blocks"):
-            # The block stream already weighted each emitted part by the region
-            # it covers, inside the loop. Running the per-client rule here would
-            # overwrite those with one scalar per client, which is precisely the
-            # inert-and-then-harmful behaviour that per-region weighting exists
-            # to replace.
-            self._apply_cascade_weights(
-                round_num, w_locals, w_local_owner, round_deliveries
             )
         # Multiply weight with dataset size proportion to global dataset size
         # (len(w_locals) may be < client_num_per_round once comm_sim drops updates)

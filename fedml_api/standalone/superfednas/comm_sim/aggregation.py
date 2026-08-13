@@ -206,11 +206,15 @@ def inverse_frequency_correction(freq, w_max=DEFAULT_W_MAX):
 def cascade_weights(deliveries, w_max=DEFAULT_W_MAX, laplace=DEFAULT_LAPLACE):
     """Per-client weights for the CASCADE rule.
 
-    Kept for the paths that contribute a single, undifferentiated update (the
-    shell path and all-or-nothing), where there is only one weight to give. The
-    block stream uses inverse_frequency_correction per emitted part instead,
-    because its parts map to regions and a single scalar cannot express a
-    per-region correction.
+    NOT USED IN PRODUCTION, and the reason is worth stating rather than leaving
+    a reader to wonder. The trainer refuses `--aggregation_rule cascade` on any
+    mode other than nested_blocks, because only the block stream emits parts
+    that map to regions; on every other path a client contributes one
+    undifferentiated update, and the only available weight is a single scalar
+    indexed by the deepest region that client reached -- which is ~1 by
+    construction and therefore inert. So this function is the per-client form
+    kept for reference and covered by the self-tests; the live path is
+    inverse_frequency_correction applied per emitted part.
     """
     if not deliveries:
         return []
