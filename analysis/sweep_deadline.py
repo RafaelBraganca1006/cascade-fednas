@@ -47,11 +47,32 @@ figure script reads locally.
 import argparse
 import csv
 import os
+import pickle
 import sys
 
 import numpy as np
 
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+def _find_code_root():
+    """Locate the directory that holds ``fedml_api``.
+
+    This script exists in two places -- ``analysis/`` at the repository root
+    (where the figures live) and ``dynfednas_v2/analysis/`` (what the cluster
+    checks out) -- and the code root sits at a different depth in each. Probing
+    for it lets ONE file serve both, which matters more than it sounds: the two
+    copies had already drifted apart once, and a stale duplicate of a script
+    whose whole job is to produce numbers fails silently, by printing older
+    numbers rather than by crashing.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, ".."),
+                 os.path.join(here, "..", "dynfednas_v2")):
+        cand = os.path.abspath(cand)
+        if os.path.isdir(os.path.join(cand, "fedml_api")):
+            return cand
+    raise RuntimeError("cannot find fedml_api from %s" % here)
+
+
+_ROOT = _find_code_root()
 sys.path.insert(0, _ROOT)
 # ServerModel/__init__ imports ServerDarts, whose model.py uses the ABSOLUTE
 # import `from darts.operations import *`. train.py puts the elastic_nn
@@ -70,18 +91,26 @@ sys.path.append(os.path.join(
 # Duplicated rather than imported because importing train.py would pull in its
 # argparse, wandb and dataset machinery. If a third caller ever needs it, move
 # it into a small module both import instead of copying it a third time.
-import torch  # noqa: E402
-
-if not hasattr(torch, "_six"):
-    import types as _types
-    import queue as _queue
-    import collections.abc as _abc
-    _six = _types.ModuleType("torch._six")
-    _six.queue = _queue
-    _six.string_classes = (str,)
-    _six.int_classes = (int,)
-    _six.container_abcs = _abc
-    sys.modules["torch._six"] = _six
+#
+# Skipped when torch is absent, which is a supported way to run this script:
+# only replay_plans() needs it, and `--plans` reads a pickle produced by an
+# earlier replay. comm_sim.transmission and comm_sim.sharding -- everything the
+# sweep itself touches -- import nothing beyond numpy.
+try:
+    import torch  # noqa: E402
+except ImportError:
+    torch = None
+else:
+    if not hasattr(torch, "_six"):
+        import types as _types
+        import queue as _queue
+        import collections.abc as _abc
+        _six = _types.ModuleType("torch._six")
+        _six.queue = _queue
+        _six.string_classes = (str,)
+        _six.int_classes = (int,)
+        _six.container_abcs = _abc
+        sys.modules["torch._six"] = _six
 # --- end compat shim ---------------------------------------------------------
 
 from fedml_api.standalone.superfednas.comm_sim.bandwidth import (  # noqa: E402
@@ -218,34 +247,61 @@ def replay_plans(rounds=ROUNDS):
     return out
 
 
-def sweep(plans, bw, deadlines, fixed_payloads):
+def sweep(plans, bw_for, deadlines, fixed_payloads):
     """For each method and deadline, aggregate drop and waste exactly as
     CommSimulator does: drop = slots delivering nothing / slots, waste =
-    wasted bits / attempted bits."""
+    wasted bits / attempted bits.
+
+    ``bw_for(T) -> BandwidthModel``. It is a factory rather than a single model
+    because the trace-replay model integrates the measured series over the round
+    window, so a model built for one deadline is not valid at another. The
+    synthetic factory ignores T and returns the same chain every time.
+
+    Also accumulates ``wall_clock_h``: the campaign's communication wall-clock,
+    summing CommSimulator's own round-time rule (the deadline if anything was
+    still in flight when it expired, otherwise the last successful upload's
+    finish time). That column is what makes "just raise the deadline" a
+    quantified trade instead of a free win -- see docs/THESIS.md 4.2.
+    """
     rows = []
+    per_round = {}
+    for rnd, cli, full, plan, stream in plans:
+        per_round.setdefault(rnd, []).append((cli, full, plan, stream))
+
     for T in deadlines:
+        bw = bw_for(T)
         acc = {}
 
-        def add(method, report):
-            a = acc.setdefault(method, dict(drop=0, n=0, att=0.0, wst=0.0))
+        def add(method, report, rnd_acc):
+            a = acc.setdefault(method, dict(drop=0, n=0, att=0.0, wst=0.0,
+                                            wall=0.0))
             a["n"] += 1
             a["att"] += report.bits_attempted
             a["wst"] += report.bits_wasted
             if report.delivers_nothing():
                 a["drop"] += 1
+            m = rnd_acc.setdefault(method, dict(any_incomplete=False, tmax=0.0))
+            if report.completed_plan:
+                m["tmax"] = max(m["tmax"], report.time_used)
+            else:
+                m["any_incomplete"] = True
 
-        for rnd, cli, full, plan, stream in plans:
-            b = bw.bandwidth(cli, rnd)
-            budget = b * T
-            # fixed-payload single-model methods
-            for name, pay in fixed_payloads.items():
-                add(name, all_or_nothing(pay, budget, b, T))
-            # the supernet arms
-            add("SuperFedNAS (all-or-nothing)",
-                all_or_nothing(full, budget, b, T))
-            add("DynFedNAS (nested)", truncate(plan, budget, b, T))
-            add("DynFedNAS (block stream)",
-                truncate_stream(stream, budget, b, T))
+        for rnd in sorted(per_round):
+            rnd_acc = {}
+            for cli, full, plan, stream in per_round[rnd]:
+                b = bw.bandwidth(cli, rnd)
+                budget = b * T
+                # fixed-payload single-model methods
+                for name, pay in fixed_payloads.items():
+                    add(name, all_or_nothing(pay, budget, b, T), rnd_acc)
+                # the supernet arms
+                add("SuperFedNAS (all-or-nothing)",
+                    all_or_nothing(full, budget, b, T), rnd_acc)
+                add("DynFedNAS (nested)", truncate(plan, budget, b, T), rnd_acc)
+                add("DynFedNAS (block stream)",
+                    truncate_stream(stream, budget, b, T), rnd_acc)
+            for method, m in rnd_acc.items():
+                acc[method]["wall"] += T if m["any_incomplete"] else m["tmax"]
 
         for method, a in acc.items():
             rows.append({
@@ -254,57 +310,159 @@ def sweep(plans, bw, deadlines, fixed_payloads):
                 "drop_pct": 100.0 * a["drop"] / max(a["n"], 1),
                 "waste_pct": 100.0 * a["wst"] / max(a["att"], 1e-9),
                 "attempted_gb": a["att"] / 8e9,
+                "wall_clock_h": a["wall"] / 3600.0,
             })
         print("  T=%-6g done" % T, flush=True)
     return rows
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--deadlines", type=float, nargs="+",
-                    default=[10, 15, 20, 30, 40, 60, 80, 100, 120])
-    ap.add_argument("--rounds", type=int, default=ROUNDS,
-                    help="replay fewer rounds (smoke only -- the CSV is "
-                         "only valid at the full 150)")
-    ap.add_argument("--out", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "csv", "deadline_sweep.csv"))
-    args = ap.parse_args()
-
-    print("replaying the run (arch draws are deadline-independent)...")
-    plans = replay_plans(args.rounds)
-    bw = build_bandwidth()
-
-    # Fixed-payload baselines. Sized from the real models, not from the logs.
-
+def build_fixed_payloads():
+    """Fixed-payload baselines, sized from the real models, not from the logs."""
     from fedml_api.model.cv.resnet_gn import resnet18
     from fedml_api.standalone.superfednas.elastic_nn.darts.model import NetworkCIFAR
     from fedml_api.standalone.superfednas.elastic_nn.darts import genotypes
 
     fedavg = resnet18(num_classes=10)
     fednas = NetworkCIFAR(128, 10, 20, False, genotypes.FedNAS_V1)
-    fixed = {
+    return {
         "FedAvg": sum(p.numel() for p in fedavg.parameters()
                       if p.requires_grad) * BYTES_PER_PARAM * 8,
         "FedNAS-DARTS": sum(p.numel() for p in fednas.parameters()
                             if p.requires_grad) * BYTES_PER_PARAM * 8,
     }
+
+
+def build_trace_bandwidth_factory(num_clients, num_rounds, seed, patterns,
+                                  ul_factor, archive):
+    """A ``bw_for(T)`` over the measured Irish 4G traces.
+
+    A fresh model per deadline, because the replay integrates the 1 Hz series
+    over the round window: the T=20 model averages 20 samples per round, the
+    T=120 model averages 120. The client->trace assignment and the start offsets
+    are drawn from the seed alone, so every deadline in a sweep replays the SAME
+    twenty measured links over the same stretch of real time, and the curve is a
+    function of T and nothing else.
+    """
+    from fedml_api.standalone.superfednas.comm_sim.bandwidth import (
+        TraceReplayBandwidth,
+    )
+    from fedml_api.standalone.superfednas.comm_sim.traces import (
+        load_client_traces,
+    )
+
+    client_traces, offsets, which = load_client_traces(
+        num_clients, seed=seed, patterns=patterns, ul_factor=ul_factor,
+        path=archive)
+    mix = {p: which.count(p) for p in sorted(set(which))}
+    print("  trace population: %s  (ul_factor=%.2f)" % (mix, ul_factor))
+    allv = np.concatenate([client_traces[c] for c in client_traces])
+    print("  measured throughput over the drawn traces: p10 %.2f / p50 %.2f / "
+          "p90 %.2f Mbps" % tuple(np.percentile(allv, [10, 50, 90]) / 1e6))
+
+    def bw_for(T):
+        return TraceReplayBandwidth(client_traces, num_rounds=num_rounds,
+                                    window_s=T, sample_hz=1.0,
+                                    start_offsets=offsets)
+    return bw_for
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--deadlines", type=float, nargs="+",
+                    default=[10, 15, 20, 30, 40, 60, 80, 100, 120])
+    ap.add_argument("--rounds", type=int, default=ROUNDS,
+                    help="replay fewer rounds (smoke only -- the CSV is "
+                         "only valid at the full 150)")
+    ap.add_argument("--bandwidth", choices=["synthetic", "trace"],
+                    default="synthetic",
+                    help="synthetic = the canonical tiered_continuous chains; "
+                         "trace = replay of the measured Irish 4G dataset")
+    ap.add_argument("--trace-patterns", nargs="+", default=None,
+                    choices=["static", "pedestrian", "car", "bus", "train"],
+                    help="restrict the trace population to these mobility "
+                         "patterns (default: all five)")
+    ap.add_argument("--trace-seed", type=int, default=BW_SEED)
+    ap.add_argument("--ul-factor", type=float, default=1.0,
+                    help="scale every measured sample; 1.0 = as measured "
+                         "(downlink, optimistic for an uplink deadline), "
+                         "0.5 = the pessimistic sensitivity")
+    ap.add_argument("--trace-archive", default=None)
+    # The replay is the only step that needs torch. Dumping it once lets the
+    # sweep -- and every re-sweep under a different bandwidth model -- run
+    # anywhere, since comm_sim.transmission and comm_sim.sharding are torch-free.
+    ap.add_argument("--dump-plans", default=None,
+                    help="replay, write the plans to this pickle, and stop")
+    ap.add_argument("--plans", default=None,
+                    help="load plans from a pickle instead of replaying "
+                         "(no torch needed)")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    if args.plans:
+        with open(args.plans, "rb") as fh:
+            blob = pickle.load(fh)
+        plans, fixed, dumped_rounds = (blob["plans"], blob["fixed"],
+                                       blob["rounds"])
+        if dumped_rounds != args.rounds:
+            sys.exit("the pickle holds %d rounds but --rounds is %d; re-dump"
+                     % (dumped_rounds, args.rounds))
+        print("loaded %d plan slots from %s" % (len(plans), args.plans))
+    else:
+        print("replaying the run (arch draws are deadline-independent)...")
+        plans = replay_plans(args.rounds)
+        fixed = build_fixed_payloads()
+
     for k, v in fixed.items():
         print("  %-14s payload %.1f MB" % (k, v / 8e6))
 
+    if args.dump_plans:
+        os.makedirs(os.path.dirname(os.path.abspath(args.dump_plans)),
+                    exist_ok=True)
+        with open(args.dump_plans, "wb") as fh:
+            pickle.dump(dict(plans=plans, fixed=fixed, rounds=args.rounds), fh)
+        print("PLANS -> %s (%.1f MB)"
+              % (args.dump_plans, os.path.getsize(args.dump_plans) / 1e6))
+        return
+
+    if args.bandwidth == "trace":
+        bw_for = build_trace_bandwidth_factory(
+            NUM_CLIENTS, args.rounds, args.trace_seed, args.trace_patterns,
+            args.ul_factor, args.trace_archive)
+    else:
+        chain = build_bandwidth()
+        bw_for = lambda T: chain  # noqa: E731 -- T-independent by construction
+
+    out = args.out or os.path.join(
+        here, "csv", "deadline_sweep%s.csv"
+        % ("" if args.bandwidth == "synthetic" else "_trace"))
+
     deadlines = sorted(set(list(args.deadlines) + [20.0]))
     print("sweeping %d deadlines..." % len(deadlines))
-    rows = sweep(plans, bw, deadlines, fixed)
+    rows = sweep(plans, bw_for, deadlines, fixed)
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with open(args.out, "w", newline="") as fh:
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=[
-            "method", "deadline_s", "drop_pct", "waste_pct", "attempted_gb"])
+            "method", "deadline_s", "drop_pct", "waste_pct", "attempted_gb",
+            "wall_clock_h"])
         w.writeheader()
         for r in sorted(rows, key=lambda r: (r["method"], r["deadline_s"])):
             w.writerow(r)
-    print("CSV -> %s" % args.out)
+    print("CSV -> %s" % out)
 
     # ---- self-validation against the measured runs -------------------------
+    # Only the synthetic model has GPU runs to be validated against. The trace
+    # sweep is a DIFFERENT bandwidth process, so a residual against those runs
+    # would be meaningless -- it is the mechanism code that is shared and
+    # already validated, not the bandwidth.
+    if args.bandwidth != "synthetic":
+        print("\n(no validation table: the measured runs used the synthetic "
+              "chains, so there is nothing to compare a trace sweep against. "
+              "The transmission code being exercised is the same code the "
+              "synthetic sweep validates to 0.10 pp.)")
+        return
+
     print("\nVALIDATION at T=20 (offline vs the real GPU runs)")
     print("%-30s %-18s %-18s" % ("method", "drop  off/meas", "waste off/meas"))
     worst = 0.0

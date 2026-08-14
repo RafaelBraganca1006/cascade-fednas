@@ -194,6 +194,25 @@ class MarkovBandwidth(BandwidthModel):
         varies. Mean bandwidth per client is unchanged vs ``tiered`` (the
         multiplier is median-normalized), so profile comparisons isolate
         variance.
+
+        CALIBRATION OUTCOME (E9, 2026-08-14). The Irish traces are now loaded
+        (``comm_sim.traces``) and the comparison has been made. It splits:
+
+          - VARIANCE is well calibrated, slightly high. Total sd of log
+            per-round throughput is 1.38 here against 1.15 measured. The
+            exploratory 0.45 needs no revision; note that this figure is the
+            chain and the jitter together, and jitter_sigma alone is not
+            separately identifiable from the traces, which is why it is left
+            where it is rather than fitted to a number it cannot support.
+          - LEVEL is optimistic by ~3x. Median per-round throughput is
+            20.3 Mbps here against 6.5 Mbps measured. The synthetic setting is
+            KINDER to the baselines than measured 4G, not harsher.
+
+        The states are deliberately left at 50/10/2 Mbps despite that. Every
+        result in results/README.md is measured on them, and re-levelling would
+        invalidate the lot to make the mechanism look better. The gap is
+        reported instead, and the trace replay is what carries the realism
+        claim (docs/THESIS.md 4.2.y).
         """
         assert len(client_tiers) == num_clients
         mbps = 1e6
@@ -241,19 +260,77 @@ def assign_connectivity_tiers(client_class_counts, fractions=(0.3, 0.4, 0.3),
 
 
 class TraceReplayBandwidth(BandwidthModel):
-    """Replay real bandwidth traces (Irish 4G LTE dataset — measured uplink
-    throughput across five mobility patterns; Raca et al., MMSys 2018).
+    """Replay measured bandwidth traces (Irish 4G LTE dataset, Raca et al.,
+    MMSys 2018 — 135 traces at 1 Hz across five mobility patterns).
 
-    Placeholder for Phase 5. Each client is assigned a trace (a 1D array of
-    throughput samples in bits/sec); ``bandwidth(c, r)`` indexes into it,
-    looping/segmenting as needed to cover all rounds. Implemented once the
-    synthetic mechanism is validated.
+    Each client owns one trace: a 1D array of throughput samples in bits/sec at
+    ``sample_hz``. Round ``r`` consumes the ``window_s``-second slice that
+    follows round ``r-1``, wrapping when the trace runs out, so consecutive
+    rounds see consecutive real time and the trace's own temporal correlation
+    is what drives the simulation. ``bandwidth(c, r)`` returns the slice MEAN,
+    which is the right summary because the simulator only ever uses it as
+    ``budget = bandwidth * window_s`` — and the mean of the slice times its
+    length is exactly the bits the measured link carried in that window. No
+    fidelity is lost by collapsing the slice to a scalar; the alternative
+    (holding one 1 Hz sample for a 20 s round) would discard 95% of the
+    measurements and badly overstate the variance.
+
+    ``window_s`` must therefore be the deadline the run uses. A model built for
+    T=20 is not valid at T=60; build another. ``from_arrays`` is the ordinary
+    constructor and ``comm_sim.traces.load_client_traces`` builds the dict.
+
+    Deterministic and order-independent: the whole (client, round) grid is
+    precomputed in ``__init__``, exactly as ``MarkovBandwidth`` does, because
+    the simulator queries the same (c, r) more than once per round and those
+    queries MUST agree.
+
+    Parameters
+    ----------
+    client_traces_bps : dict[int, np.ndarray]  per-client throughput, bits/sec
+    num_rounds : int                           grid length to precompute
+    window_s : float                           round deadline, seconds
+    sample_hz : float                          trace sampling rate (1.0 for 4G)
+    start_offsets : dict[int, int] or None     per-client start sample
     """
 
-    def __init__(self, client_traces_bps):
-        # client_traces_bps: dict[int, np.ndarray] of per-client throughput series
-        self.traces = {c: np.asarray(t, dtype=float) for c, t in client_traces_bps.items()}
+    def __init__(self, client_traces_bps, num_rounds, window_s, sample_hz=1.0,
+                 start_offsets=None):
+        self.traces = {c: np.asarray(t, dtype=float)
+                       for c, t in client_traces_bps.items()}
+        for c, t in self.traces.items():
+            if t.size == 0:
+                raise ValueError("client %r has an empty trace" % (c,))
+        self.num_rounds = int(num_rounds)
+        self.window_s = float(window_s)
+        self.sample_hz = float(sample_hz)
+        self.start_offsets = dict(start_offsets or {})
+
+        # Samples per round. At least one: a deadline shorter than the sampling
+        # period cannot resolve below a single sample, and silently averaging
+        # zero samples would produce nan rather than an error.
+        w = max(1, int(round(self.window_s * self.sample_hz)))
+        self.samples_per_round = w
+
+        self.clients = sorted(self.traces)
+        self._bw = np.zeros((max(self.clients) + 1, self.num_rounds),
+                            dtype=float)
+        for c in self.clients:
+            t = self.traces[c]
+            start = int(self.start_offsets.get(c, 0)) % t.size
+            # Index arithmetic modulo the trace length: rounds wrap around a
+            # finite recording rather than running off its end. Wrapping is the
+            # standard treatment for these traces and is why the start offset is
+            # randomised per client — otherwise every client sharing a trace
+            # would wrap in lockstep.
+            idx = (start + np.arange(self.num_rounds * w)) % t.size
+            self._bw[c] = t[idx].reshape(self.num_rounds, w).mean(axis=1)
 
     def bandwidth(self, client_idx, round_num):
-        trace = self.traces[client_idx]
-        return float(trace[round_num % len(trace)])
+        r = min(round_num, self.num_rounds - 1)  # clamp if run overshoots
+        return float(self._bw[client_idx, r])
+
+    @classmethod
+    def from_arrays(cls, client_traces_bps, num_rounds, window_s, sample_hz=1.0,
+                    start_offsets=None):
+        return cls(client_traces_bps, num_rounds, window_s, sample_hz,
+                   start_offsets)
