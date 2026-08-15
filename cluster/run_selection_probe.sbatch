@@ -208,7 +208,28 @@ fi
 RUN_NAME="e6b_${MODEL:0:6}_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_agg${AGGRULE}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}_s${SEED}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
-cd "$SLURM_SUBMIT_DIR/fedml_experiments/standalone/superfednas"
+# Locate the repo root, and REFUSE to continue if it is not found.
+#
+# This used to be a bare `cd "$SLURM_SUBMIT_DIR/fedml_experiments/..."`, which
+# assumes the job was submitted from the repo root. Submitting from `cluster/`
+# instead -- the natural thing to do, since the script lives there -- made the
+# cd fail, `python train.py` fail, and the script run on to its summary and exit
+# 0. Slurm then recorded COMPLETED, with an elapsed time of one second and no
+# training whatsoever. Jobs 105872 and 105873 were lost that way on 2026-08-15;
+# they cost no GPU time, but "COMPLETED" on a job that did nothing is the worst
+# possible failure mode, because nothing asks to be looked at.
+#
+# Two fixes, because either alone is not enough: accept BOTH submission
+# directories, and make a missing target fatal rather than advisory.
+ROOT="$SLURM_SUBMIT_DIR"
+[ -d "$ROOT/fedml_experiments" ] || ROOT="$SLURM_SUBMIT_DIR/.."
+TRAIN_DIR="$ROOT/fedml_experiments/standalone/superfednas"
+if [ ! -f "$TRAIN_DIR/train.py" ]; then
+  echo "FATAL: no train.py under $TRAIN_DIR" >&2
+  echo "       (submitted from $SLURM_SUBMIT_DIR)" >&2
+  exit 2
+fi
+cd "$TRAIN_DIR" || exit 2
 python train.py \
   --gpu 0 --dataset cifar10 --data_dir ./../../../data/cifar10 \
   --model "$MODEL" --init_channel_size "$DARTS_C" --darts_layers "$DARTS_LAYERS" \
@@ -226,7 +247,15 @@ python train.py \
   $SEL_FLAG \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
 
+STATUS=$?
+
 OUT="$SLURM_SUBMIT_DIR/e6b_$SLURM_JOB_ID.out"
+if [ "$STATUS" -ne 0 ]; then
+  # Propagate the failure instead of ending on a cheerful summary. Slurm marks
+  # the job FAILED, which is the only way a dead run announces itself.
+  echo "=== E6b FAILED: $RUN_NAME (train.py exit $STATUS) ===" >&2
+  exit "$STATUS"
+fi
 echo "=== E6b done: $RUN_NAME -- summary ==="
 grep "connectivity tiers" "$OUT" 2>/dev/null | head -1
 grep "bandwidth spread"   "$OUT" 2>/dev/null | head -1
