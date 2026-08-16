@@ -173,6 +173,16 @@ AGGRULE="${17:-auto}"
 # and 1.44 on spread by round 149. Nothing below that is a result without seeds.
 SEED="${18:-0}"
 
+# Dataset. Defaults to cifar10 so every existing invocation is unchanged.
+# `n_classes` is taken from the loader in train.py, and the model name's
+# "_10_26" is a depth/width tag rather than a class count, so cifar100 needs no
+# model change -- only the data. Validated by the smoke before any full run.
+DATASET="${19:-cifar10}"
+case "$DATASET" in
+  cifar10|cifar100|cinic10) ;;
+  *) echo "FATAL: unsupported dataset '$DATASET'" >&2; exit 2 ;;
+esac
+
 # The DARTS baseline has ONE architecture, so the supernet machinery has to be
 # switched off for it: TS_all_random calls get_subnet(**arch_config) and
 # ServerDarts returns a Genotype, not a mapping (that is the crash), and
@@ -205,7 +215,7 @@ else
     COMM_FLAGS="$COMM_FLAGS --maxnet_delivery_aware"
   fi
 fi
-RUN_NAME="e6b_${MODEL:0:6}_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_agg${AGGRULE}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}_s${SEED}"
+RUN_NAME="e6b_${DATASET}_${MODEL:0:6}_${TXMODE}_samp${SAMPLER}_ord${BLOCKORDER}_piv${PIVOT}_mx${MAXNETFIX}_agg${AGGRULE}_sel-${SELECTION}_c${CORR}_d${DEADLINE}_a${ALPHA}_j${JITTER}_r${ROUNDS}_s${SEED}"
 echo "=== dynFedNAS E6b Stage 1 | selection=${SELECTION} corr=${CORR} deadline=${DEADLINE}s alpha=${ALPHA} jitter=${JITTER} rounds=${ROUNDS} ==="
 
 # Locate the repo root, and REFUSE to continue if it is not found.
@@ -231,7 +241,7 @@ if [ ! -f "$TRAIN_DIR/train.py" ]; then
 fi
 cd "$TRAIN_DIR" || exit 2
 python train.py \
-  --gpu 0 --dataset cifar10 --data_dir ./../../../data/cifar10 \
+  --gpu 0 --dataset "$DATASET" --data_dir "./../../../data/$DATASET" \
   --model "$MODEL" --init_channel_size "$DARTS_C" --darts_layers "$DARTS_LAYERS" \
   --partition_method hetero \
   --client_num_in_total 20 --client_num_per_round 8 --comm_round "$ROUNDS" \
