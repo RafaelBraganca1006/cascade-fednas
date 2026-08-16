@@ -249,7 +249,15 @@ def load_partition_data_cifar100(dataset, data_dir, partition_method, partition_
     logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
     train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
 
-    train_data_global, test_data_global = get_dataloader(dataset, data_dir, batch_size, batch_size, load_from_pkl)
+    # `load_from_pkl` MUST be passed by keyword. Positionally it lands in
+    # `dataidxs` (the 5th parameter), and since `False is not None` the
+    # truncation branch in CIFAR100_truncated then fires with a boolean scalar
+    # index: `data[False]` is not a no-op, it returns an empty array. The global
+    # train loader came out with zero samples and DataLoader raised
+    # "num_samples should be a positive integer value, but got num_samples=0".
+    # The cifar10 loader already passes it by keyword; this one did not.
+    train_data_global, test_data_global = get_dataloader(
+        dataset, data_dir, batch_size, batch_size, load_from_pkl=load_from_pkl)
     logging.info("train_dl_global number = " + str(len(train_data_global)))
     logging.info("test_dl_global number = " + str(len(train_data_global)))
     test_data_num = len(test_data_global)
