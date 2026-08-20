@@ -1,8 +1,17 @@
 #!/bin/bash
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=projects
 #SBATCH --gpus=1
 #SBATCH --output=search_pareto_%j.out
+#
+# WHY THE LOWEST CONSTRAINT IS 1.0 AND NOT LOWER (measured 2026-08-20).
+# A 0.5 GFLOP ceiling was tried to cover the smallest ladder tier and job 106277
+# timed out after 4 h having admitted ONE architecture from 892 random samples.
+# The minimum subnet is 0.459 GFLOPs, so a 0.5 ceiling only accepts architectures
+# sitting on the floor of the space, which random sampling essentially never
+# produces; a population of 50 would need ~45k draws. The tier is also the
+# minimum itself, so there is nothing there to search for. Constraints must stay
+# where random sampling has room above the floor.
 #
 # dynFedNAS — Pareto search only (skips tiers/population which may already exist).
 #
@@ -47,7 +56,7 @@ else
 fi
 
 python -u search_phase.py --ckpt "$CKPT" --mode pareto \
-  --constraints 0.5 1.0 1.5 2.0 2.5 3.5 \
+  --constraints 1.0 1.5 2.0 2.5 3.5 \
   --bn_recal_batches 0 \
   --fitness_batches 10 \
   --max_time_budget "$TIME_BUDGET" \
