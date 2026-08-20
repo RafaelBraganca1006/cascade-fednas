@@ -214,10 +214,17 @@ def get_flops(supernet, model_arch):
 def nas_flop(supernet, dataset, device, constraint, args):
     """Helpful internal functions"""
 
+    # Bounded rejection sampling. This loop used to be `while True`, so a
+    # constraint that random sampling almost never satisfies did not fail, it
+    # spun until the job hit its walltime: search 106277 burned four GPU-hours
+    # rejecting 44,600 architectures under a 0.5 GFLOP ceiling before Slurm
+    # killed it. The ceiling was below what the space can reach in practice, and
+    # nothing reported that. Returning None instead lets the caller say so.
+    MAX_DRAWS = 20000
+
     def random_sample():
         debug_rate = 50
-        counter = 0
-        while True:
+        for counter in range(MAX_DRAWS):
             sample_arch = supernet.random_subnet_arch()
             sample_eff, _ = get_flops(supernet, sample_arch)
             sample_eff /= 10e8
@@ -225,7 +232,12 @@ def nas_flop(supernet, dataset, device, constraint, args):
                 print(f"sampled efficiency flops: {sample_eff}")
             if sample_eff <= constraint:
                 return sample_arch, sample_eff
-            counter += 1
+        print(
+            f"UNREACHABLE CONSTRAINT: {MAX_DRAWS} random architectures drawn, "
+            f"none at or below {constraint} GFLOPs. The constraint sits below "
+            f"what this search space reaches by sampling; raise it."
+        )
+        return None
 
     if supernet is None:
         print("Supernet mismatch, no supernet received!")
@@ -246,7 +258,10 @@ def nas_flop(supernet, dataset, device, constraint, args):
     best_info = None
     print("Generate random population...")
     for i in range(population_size):
-        sample, efficiency = random_sample()
+        drawn = random_sample()
+        if drawn is None:
+            return best_valids, None
+        sample, efficiency = drawn
         child_pool.append(sample)
         efficiency_pool.append(efficiency)
         print(f"got {i}th individual")
