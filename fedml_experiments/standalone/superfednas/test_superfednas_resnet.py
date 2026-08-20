@@ -211,31 +211,89 @@ def get_flops(supernet, model_arch):
     return flops
 
 
+DEPTH_CHOICES = [0, 1, 2]
+EXPAND_CHOICES = [0.1, 0.14, 0.18, 0.22, 0.25]
+
+
+def _repair_into_band(supernet, arch, lo, hi, max_steps=80):
+    """Walk an architecture into the cost band [lo, hi], one coordinate at a time.
+
+    WHY REJECTION SAMPLING CANNOT DO THIS. The space is d in {0,1,2}^4 and e in
+    {0.1..0.25}^12, sampled uniformly and independently, so a draw concentrates
+    hard around the middle: reaching the cheapest corner (all d=0, all e=0.1,
+    0.46 GMAC) or the dearest (all d=2, all e=0.25, 3.40 GMAC) has probability
+    (1/3)^4 * (1/5)^12, about 5e-11. Rejection sampling therefore cannot reach
+    either end of the ladder -- not slowly, but not at all -- which is why
+    search 106277 rejected 44,600 architectures under a 0.5 GFLOP ceiling and
+    was killed by its walltime, and why a 3.5 ceiling used to return ~1.3 GMAC
+    architectures: a ceiling only excludes, it never pushes toward the budget.
+
+    Repairing instead of resampling costs a handful of profiler calls per
+    individual and always lands in a non-empty band.
+    """
+    arch = {"d": list(arch["d"]), "e": list(arch["e"])}
+
+    def cost(a):
+        return get_flops(supernet, a)[0] / 10e8
+
+    eff = cost(arch)
+    for _ in range(max_steps):
+        if lo <= eff <= hi:
+            return arch, eff
+        grow = eff < lo
+        # Coordinates that can still move in the needed direction.
+        moves = []
+        for i, d in enumerate(arch["d"]):
+            j = DEPTH_CHOICES.index(d) + (1 if grow else -1)
+            if 0 <= j < len(DEPTH_CHOICES):
+                moves.append(("d", i, DEPTH_CHOICES[j]))
+        for i, e in enumerate(arch["e"]):
+            j = EXPAND_CHOICES.index(e) + (1 if grow else -1)
+            if 0 <= j < len(EXPAND_CHOICES):
+                moves.append(("e", i, EXPAND_CHOICES[j]))
+        if not moves:
+            break  # already at a corner of the space; the band is unreachable
+        key, idx, val = moves[np.random.randint(len(moves))]
+        prev = arch[key][idx]
+        arch[key][idx] = val
+        new_eff = cost(arch)
+        # A step that overshoots past the far side of the band is worse than the
+        # one before it; keep whichever is closer to the band.
+        if grow and new_eff > hi and (new_eff - hi) > (lo - eff):
+            arch[key][idx] = prev
+            return arch, eff
+        if not grow and new_eff < lo and (lo - new_eff) > (eff - hi):
+            arch[key][idx] = prev
+            return arch, eff
+        eff = new_eff
+    return (arch, eff) if lo <= eff <= hi else None
+
+
 def nas_flop(supernet, dataset, device, constraint, args):
     """Helpful internal functions"""
 
-    # Bounded rejection sampling. This loop used to be `while True`, so a
-    # constraint that random sampling almost never satisfies did not fail, it
-    # spun until the job hit its walltime: search 106277 burned four GPU-hours
-    # rejecting 44,600 architectures under a 0.5 GFLOP ceiling before Slurm
-    # killed it. The ceiling was below what the space can reach in practice, and
-    # nothing reported that. Returning None instead lets the caller say so.
-    MAX_DRAWS = 20000
+    # The constraint is a BAND, not a ceiling. A ceiling alone leaves the search
+    # free to return an architecture far below the budget it was given, which is
+    # exactly what happened: every arm answered a 3.5 GMAC budget with something
+    # near 1.3, so the reported front spanned a third of the ladder and looked
+    # flat. The floor makes "best architecture AT this budget" the question the
+    # search actually answers.
+    floor_ratio = getattr(args, "nas_floor_ratio", 0.75)
+    lo, hi = floor_ratio * constraint, constraint
+    MAX_DRAWS = 200
 
     def random_sample():
-        debug_rate = 50
         for counter in range(MAX_DRAWS):
-            sample_arch = supernet.random_subnet_arch()
-            sample_eff, _ = get_flops(supernet, sample_arch)
-            sample_eff /= 10e8
-            if counter % debug_rate == 0:
-                print(f"sampled efficiency flops: {sample_eff}")
-            if sample_eff <= constraint:
-                return sample_arch, sample_eff
+            drawn = _repair_into_band(
+                supernet, supernet.random_subnet_arch(), lo, hi)
+            if drawn is not None:
+                if counter % 25 == 0:
+                    print(f"sampled in band [{lo:.2f}, {hi:.2f}]: {drawn[1]:.3f}")
+                return drawn
         print(
-            f"UNREACHABLE CONSTRAINT: {MAX_DRAWS} random architectures drawn, "
-            f"none at or below {constraint} GFLOPs. The constraint sits below "
-            f"what this search space reaches by sampling; raise it."
+            f"UNREACHABLE BAND [{lo:.2f}, {hi:.2f}] GFLOPs: {MAX_DRAWS} repaired "
+            f"draws, none landed inside. This space spans 0.46 to 3.40 GMAC; a "
+            f"band outside that cannot be met."
         )
         return None
 
@@ -317,14 +375,22 @@ def nas_flop(supernet, dataset, device, constraint, args):
                 file1.close()"""
                 par_sample = population[np.random.randint(parents_size)][1]
                 # Mutate
-                new_sample = supernet.mutate_sample(par_sample, args.mutate_prob)
-                efficiency, _ = get_flops(supernet, new_sample)
-                efficiency /= 10e8
-                if efficiency <= constraint or time_count > 50:
+                child = supernet.mutate_sample(par_sample, args.mutate_prob)
+                repaired = _repair_into_band(supernet, child, lo, hi)
+                if repaired is not None:
+                    new_sample, efficiency = repaired
                     break
-                else:
-                    new_sample = None
-                    time_count += 1
+                time_count += 1
+                if time_count > 50:
+                    # Never keep an out-of-band individual: the old code broke
+                    # out of this loop and appended the violator, so a tight
+                    # constraint silently produced a population that did not
+                    # satisfy it.
+                    drawn = random_sample()
+                    if drawn is None:
+                        return best_valids, best_info
+                    new_sample, efficiency = drawn
+                    break
             child_pool.append(new_sample)
             efficiency_pool.append(efficiency)
         print("Mating (crossover)...")
@@ -338,14 +404,18 @@ def nas_flop(supernet, dataset, device, constraint, args):
                 par_sample1 = population[np.random.randint(parents_size)][1]
                 par_sample2 = population[np.random.randint(parents_size)][1]
                 # Crossover
-                new_sample = supernet.crossover_sample(par_sample1, par_sample2)
-                efficiency, _ = get_flops(supernet, new_sample)
-                efficiency /= 10e8
-                if efficiency <= constraint or time_count > 50:
+                child = supernet.crossover_sample(par_sample1, par_sample2)
+                repaired = _repair_into_band(supernet, child, lo, hi)
+                if repaired is not None:
+                    new_sample, efficiency = repaired
                     break
-                else:
-                    new_sample = None
-                    time_count += 1
+                time_count += 1
+                if time_count > 50:
+                    drawn = random_sample()
+                    if drawn is None:
+                        return best_valids, best_info
+                    new_sample, efficiency = drawn
+                    break
             child_pool.append(new_sample)
             efficiency_pool.append(efficiency)
         print("Calculating accuracies of children...")
