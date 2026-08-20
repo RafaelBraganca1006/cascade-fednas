@@ -87,9 +87,13 @@ class MarkovBandwidth(BandwidthModel):
             # jitter_sigma=0 not a single extra random number is consumed, and
             # default()/tiered() stay bit-identical to their pre-jitter
             # trajectories (asserted in selftest_tiered_bandwidth.py).
-            # Median-normalized (lognormal's mean is exp(sigma^2/2), not 1) so
-            # the jittered profile has the SAME mean bandwidth as its discrete
-            # counterpart and only differs in variance -- otherwise a comparison
+            # MEAN-normalized: a lognormal(0, sigma) has mean exp(sigma^2/2)
+            # and median 1, so dividing by exp(sigma^2/2) fixes the MEAN at 1
+            # and leaves the median at exp(-sigma^2/2) < 1. (This comment used
+            # to say "median-normalized", which contradicted the sentence right
+            # after it; the code was always right and the label was wrong.)
+            # The point is that the jittered profile has the SAME mean bandwidth
+            # as its discrete counterpart and only differs in variance -- otherwise a comparison
             # between profiles would confound spread with a bandwidth increase.
             # Clipped at +-2 sigma in log space to keep tails physical.
             norm = np.exp(0.5 * self.jitter_sigma ** 2)
