@@ -272,28 +272,49 @@ def _repair_into_band(supernet, arch, lo, hi, max_steps=80):
 def nas_flop(supernet, dataset, device, constraint, args):
     """Helpful internal functions"""
 
-    # The constraint is a BAND, not a ceiling. A ceiling alone leaves the search
-    # free to return an architecture far below the budget it was given, which is
-    # exactly what happened: every arm answered a 3.5 GMAC budget with something
-    # near 1.3, so the reported front spanned a third of the ladder and looked
-    # flat. The floor makes "best architecture AT this budget" the question the
-    # search actually answers.
-    floor_ratio = getattr(args, "nas_floor_ratio", 0.75)
-    lo, hi = floor_ratio * constraint, constraint
-    MAX_DRAWS = 200
+    # The constraint is a CEILING again, and the reason the band was wrong is
+    # worth keeping. A budget's feasible set CONTAINS every cheaper one: a
+    # device that can afford 3.5 GMAC can deploy the 0.5 GMAC architecture too.
+    # So the best accuracy at 3.5 is by construction at least the best at 0.5,
+    # and a front that falls as the budget rises is a search failure, not a
+    # finding. A band [0.75c, c] makes the feasible sets DISJOINT and destroys
+    # that guarantee -- it answers "is a bigger model better?", which is a
+    # different question from the one a deployment front asks.
+    #
+    # The real defect the band was papering over is that uniform coordinate-wise
+    # sampling concentrates near the middle of the space, so the population
+    # never contained a large architecture to select. That is fixed here by
+    # seeding the population ACROSS the feasible range instead: individual k is
+    # repaired toward a target cost spread evenly from the space minimum up to
+    # the budget, so the search starts with the whole ladder in view and the
+    # ceiling still decides what is admissible.
+    hi = constraint
+    MAX_DRAWS = 40
 
-    def random_sample():
+    smallest = {"d": [min(DEPTH_CHOICES)] * 4,
+                "e": [min(EXPAND_CHOICES)] * len(supernet.model.blocks)}
+    floor = get_flops(supernet, smallest)[0] / 10e8
+
+    def random_sample(target=None):
+        """One individual. `target` spreads the seed population over the range;
+        without it, any architecture at or below the ceiling will do."""
         for counter in range(MAX_DRAWS):
-            drawn = _repair_into_band(
-                supernet, supernet.random_subnet_arch(), lo, hi)
+            draw = supernet.random_subnet_arch()
+            if target is None:
+                eff = get_flops(supernet, draw)[0] / 10e8
+                if eff <= hi:
+                    return draw, eff
+                drawn = _repair_into_band(supernet, draw, floor, hi)
+            else:
+                # a narrow window around the target, widening if it is missed
+                pad = 0.08 * (1 + counter) * max(target, 0.5)
+                drawn = _repair_into_band(
+                    supernet, draw, max(floor, target - pad), min(hi, target + pad))
             if drawn is not None:
-                if counter % 25 == 0:
-                    print(f"sampled in band [{lo:.2f}, {hi:.2f}]: {drawn[1]:.3f}")
                 return drawn
         print(
-            f"UNREACHABLE BAND [{lo:.2f}, {hi:.2f}] GFLOPs: {MAX_DRAWS} repaired "
-            f"draws, none landed inside. This space spans 0.46 to 3.40 GMAC; a "
-            f"band outside that cannot be met."
+            f"could not seed at target {target} under ceiling {hi:.2f} GFLOPs "
+            f"in {MAX_DRAWS} draws; this space spans {floor:.2f} to 3.40 GMAC"
         )
         return None
 
@@ -316,7 +337,12 @@ def nas_flop(supernet, dataset, device, constraint, args):
     best_info = None
     print("Generate random population...")
     for i in range(population_size):
-        drawn = random_sample()
+        # spread the seeds from the cheapest admissible architecture up to the
+        # budget, so a large one is present to be selected if it deserves to be
+        span = max(hi - floor, 1e-6)
+        drawn = random_sample(floor + span * i / max(population_size - 1, 1))
+        if drawn is None:
+            drawn = random_sample()
         if drawn is None:
             return best_valids, None
         sample, efficiency = drawn
@@ -376,7 +402,7 @@ def nas_flop(supernet, dataset, device, constraint, args):
                 par_sample = population[np.random.randint(parents_size)][1]
                 # Mutate
                 child = supernet.mutate_sample(par_sample, args.mutate_prob)
-                repaired = _repair_into_band(supernet, child, lo, hi)
+                repaired = _repair_into_band(supernet, child, floor, hi)
                 if repaired is not None:
                     new_sample, efficiency = repaired
                     break
@@ -405,7 +431,7 @@ def nas_flop(supernet, dataset, device, constraint, args):
                 par_sample2 = population[np.random.randint(parents_size)][1]
                 # Crossover
                 child = supernet.crossover_sample(par_sample1, par_sample2)
-                repaired = _repair_into_band(supernet, child, lo, hi)
+                repaired = _repair_into_band(supernet, child, floor, hi)
                 if repaired is not None:
                     new_sample, efficiency = repaired
                     break
