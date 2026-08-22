@@ -178,6 +178,10 @@ SEED="${18:-0}"
 # "_10_26" is a depth/width tag rather than a class count, so cifar100 needs no
 # model change -- only the data. Validated by the smoke before any full run.
 DATASET="${19:-cifar10}"
+# Positional 20: extra flags passed straight through to train.py, for ablations
+# that need one switch and no other change. Empty by default, so every archived
+# invocation keeps producing the identical command line.
+EXTRA_FLAGS="${20:-}"
 case "$DATASET" in
   cifar10|cifar100|cinic10) ;;
   *) echo "FATAL: unsupported dataset '$DATASET'" >&2; exit 2 ;;
@@ -255,6 +259,7 @@ python train.py \
   --block_order "$BLOCKORDER" --stream_pivot "$PIVOT" \
   $COMM_FLAGS \
   $SEL_FLAG \
+  $EXTRA_FLAGS \
   --wandb_project_name dynfednas --wandb_run_name "$RUN_NAME" --wandb_entity rbraganca-eth-z-rich
 
 STATUS=$?
