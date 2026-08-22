@@ -677,6 +677,20 @@ def add_args(parser):
         "preserves comparability with all prior results.",
     )
     parser.add_argument(
+        "--cascade_correct_prefix",
+        action="store_true",
+        help="ABLATION (thesis 5.D). By default the inverse-frequency "
+        "correction is applied only to units delivered BEYOND a client's "
+        "complete tier; the complete prefix keeps the anchor's weight, on the "
+        "argument that every client reaches the core so there is no bias there, "
+        "and that correcting it would compound with the MaxNet weight the "
+        "deepest deliverer already receives. This flag corrects every delivered "
+        "coordinate instead, prefix included, which is the uniform "
+        "inverse-probability estimator. It exists to test that argument rather "
+        "than assert it.",
+    )
+
+    parser.add_argument(
         "--aggregation_rule",
         type=str,
         default="auto",

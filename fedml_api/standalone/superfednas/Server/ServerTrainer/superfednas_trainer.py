@@ -1673,9 +1673,20 @@ class FLOFA_Trainer(ABC):
                 )
                 for part, region in parts:
                     w = maxnet_weight
-                    if self._agg_rule == "cascade" and region is not None:
+                    # region is None for the complete-tier prefix. The ablation
+                    # switch treats the prefix like any other region, which is
+                    # the uniform inverse-probability estimator; the default
+                    # leaves it alone for the reasons in the comment below.
+                    correct = region is not None or getattr(
+                        self.args, "cascade_correct_prefix", False
+                    )
+                    if self._agg_rule == "cascade" and correct:
+                        # the prefix has no region of its own; under the
+                        # ablation it is priced at the tier it completes
+                        reg = (region if region is not None
+                               else tx_report.delivered_tier)
                         self._cascade_stats.append(
-                            (region, self._coverage_freq(client_idx, region))
+                            (reg, self._coverage_freq(client_idx, reg))
                         )
                         # CASCADE (DIRECTION 3.3c): this part is a contribution
                         # to region `region`, which this client reaches only
@@ -1687,7 +1698,7 @@ class FLOFA_Trainer(ABC):
                         # clients' influence on exactly the shared weights this
                         # correction exists to protect.
                         w *= inverse_frequency_correction(
-                            self._coverage_freq(client_idx, region)
+                            self._coverage_freq(client_idx, reg)
                         )
                     part.set_avg_wt(w)
                 w_locals.extend([p for p, _ in parts])
