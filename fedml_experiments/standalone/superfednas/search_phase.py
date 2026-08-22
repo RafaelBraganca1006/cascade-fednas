@@ -103,12 +103,7 @@ def main():
     ap.add_argument("--pop", type=int, default=100, help="population mode: #archs")
     ap.add_argument("--constraints", type=float, nargs="+", default=[0.2, 0.4, 0.8, 1.6, 3.2],
                     help="pareto mode: GFLOPS constraints (upper edge of each band)")
-    ap.add_argument("--nas_floor_ratio", type=float, default=0.75,
-                    help="pareto mode: each constraint c is the band "
-                         "[nas_floor_ratio*c, c], so the search returns the best "
-                         "architecture AT the budget rather than anywhere below "
-                         "it. 1.0 would demand an exact hit; 0.0 restores the "
-                         "old ceiling-only behaviour.")
+
     ap.add_argument("--fitness", choices=["test", "train"], default="test",
                     help="pareto search fitness data (test = anchor protocol)")
     ap.add_argument("--bn_recal_batches", type=int, default=30,
