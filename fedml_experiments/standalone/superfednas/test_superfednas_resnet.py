@@ -88,6 +88,10 @@ def load_data(args, dataset_name):
             args.partition_alpha,
             args.client_num_in_total,
             args.batch_size,
+            # the CIFAR-100 loader takes a seventh argument the others do not;
+            # train.py branches for this, and so must anything else that loads
+            *([getattr(args, "use_train_pkl", False)]
+              if dataset_name == "cifar100" else []),
         )
 
     if centralized:

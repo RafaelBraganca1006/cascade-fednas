@@ -124,7 +124,9 @@ def main():
                      "here crashed pareto mode with AttributeError.")
     # data plumbing (defaults match the training runs)
     ap.add_argument("--dataset", default="cifar10")
-    ap.add_argument("--data_dir", default="./../../../data/cifar10")
+    ap.add_argument("--data_dir", default=None,
+                    help="defaults to ./../../../data/<dataset>, so it follows "
+                         "--dataset instead of silently reading cifar10")
     ap.add_argument("--partition_method", default="hetero")
     ap.add_argument("--partition_alpha", type=float, default=100.0)
     ap.add_argument("--client_num_in_total", type=int, default=20)
@@ -135,6 +137,8 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    if args.data_dir is None:
+        args.data_dir = "./../../../data/%s" % args.dataset
     dataset = load_data(args, args.dataset)
     train_global, test_global, num_classes = dataset[2], dataset[3], dataset[7]
 
