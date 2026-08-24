@@ -36,6 +36,10 @@ export WANDB_MODE=online
 CKPT="$1"
 TAG="$2"
 MODE="${3:-}"
+# Positional 4: extra flags for search_phase.py. --dataset is the one that
+# matters: it decides num_classes, and a checkpoint trained on CIFAR-100 will
+# not load into a 10-class model.
+EXTRA="${4:-}"
 
 if [ -z "$CKPT" ] || [ -z "$TAG" ]; then
   echo "usage: sbatch cluster/run_search_pareto.sbatch <CKPT_PATH> <TAG> [--full]"; exit 1
@@ -61,6 +65,6 @@ python -u search_phase.py --ckpt "$CKPT" --mode pareto \
   --fitness_batches 10 \
   --max_time_budget "$TIME_BUDGET" \
   --population_size "$POP_SIZE" \
-  --out "$OUTDIR/search_${TAG}_pareto.csv" || exit 1
+  --out "$OUTDIR/search_${TAG}_pareto.csv" $EXTRA || exit 1
 
 echo "=== pareto done: search_${TAG}_pareto.csv ==="

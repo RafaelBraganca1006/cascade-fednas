@@ -139,6 +139,17 @@ def main():
     train_global, test_global, num_classes = dataset[2], dataset[3], dataset[7]
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    # A checkpoint carries its own class count in the classifier. Checking it
+    # here turns a torch size-mismatch traceback thirty seconds into a GPU job
+    # into a sentence that names the flag to pass.
+    ck_classes = next(
+        (v.shape[0] for k, v in ckpt["params"].items()
+         if k.endswith("classifier.linear.linear.weight")), None)
+    if ck_classes is not None and ck_classes != num_classes:
+        raise SystemExit(
+            "checkpoint was trained on %d classes but --dataset %s loads %d; "
+            "pass the dataset the checkpoint was trained on"
+            % (ck_classes, args.dataset, num_classes))
     server_model = custom_ofa_net(
         ckpt["supernet_class"], num_classes, ckpt["supernet_config"], args
     )
