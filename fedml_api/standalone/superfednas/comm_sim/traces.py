@@ -95,3 +95,74 @@ def load_client_traces(num_clients, seed=0, patterns=None, ul_factor=1.0,
         offsets[c] = int(rng.integers(len(t)))
         which.append(pats[int(i)])
     return client_traces, offsets, which
+
+# ---------------------------------------------------------------------------
+# Sprout uplink traces (Winstein et al., NSDI 2013), via the Mahimahi archive.
+#
+# These are the only measured UPLINK capacity series this project could find in
+# the public domain, and they exist because the Saturator drove both directions
+# to saturation and logged when each packet crossed. Every other archive we
+# examined -- the Irish 4G set, its 5G successor, the FL-over-5G testbed -- was
+# collected while the phone DOWNLOADED, so its uplink column is acknowledgement
+# traffic rather than capacity.
+#
+# They are replayed alongside the Irish archive, not instead of it: eight drive
+# tests from 2013 have neither its variety of mobility nor its size, and the
+# Irish set has neither their direction. A claim that survives both is not
+# resting on either one's weakness.
+# ---------------------------------------------------------------------------
+
+SPROUT_ARCHIVE = os.path.join("analysis", "data", "sprout_uplink.npz")
+_SPROUT_CANDIDATES = (os.path.join(_CODE_ROOT, SPROUT_ARCHIVE),
+                      os.path.join(os.path.dirname(_CODE_ROOT), SPROUT_ARCHIVE))
+
+
+def sprout_path(path=None):
+    """Same two-depth probe as archive_path: the repository is checked out at
+    one depth locally and another on the cluster."""
+    if path:
+        return os.path.abspath(path)
+    for c in _SPROUT_CANDIDATES:
+        if os.path.exists(c):
+            return c
+    return _SPROUT_CANDIDATES[-1]
+
+
+def load_sprout_archive(path=None):
+    """Return ``(list[np.ndarray] of bits/sec, list[str] names)``."""
+    p = sprout_path(path)
+    if not os.path.exists(p):
+        raise FileNotFoundError(
+            "no uplink archive at %s -- run "
+            "`python3 analysis/fetch_mahimahi.py` to build it" % p)
+    z = np.load(p, allow_pickle=False)
+    kbps, offsets, names = z["kbps"], z["offsets"], z["names"]
+    traces = [kbps[offsets[i]:offsets[i + 1]].astype(float) * 1e3
+              for i in range(len(names))]
+    return traces, [str(n) for n in names]
+
+
+def load_sprout_client_traces(num_clients, seed=0, path=None, min_samples=120):
+    """One measured uplink trace per client, with independent start offsets.
+
+    There are eight traces and typically twenty clients, so assignment is WITH
+    replacement and the start offsets do the separating: two clients on the same
+    trace enter it at different points and so do not move in lockstep. That is
+    weaker than the Irish archive's twenty distinct links and is the price of
+    measuring the right direction.
+    """
+    traces, names = load_sprout_archive(path)
+    keep = [i for i, t in enumerate(traces) if len(t) >= min_samples]
+    if not keep:
+        raise ValueError("no uplink trace reaches %d samples" % min_samples)
+
+    rng = np.random.default_rng([seed, 20130401])
+    pick = rng.choice(keep, size=num_clients,
+                      replace=len(keep) < num_clients)
+    client_traces, offsets, which = {}, {}, []
+    for c, i in enumerate(pick):
+        t = traces[int(i)]
+        client_traces[c] = t
+        offsets[c] = int(rng.integers(len(t)))
+        which.append(names[int(i)])
+    return client_traces, offsets, which
