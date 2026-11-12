@@ -14,8 +14,8 @@ The repository is a fork of [SuperFedNAS](https://github.com/gatech-sysml/superf
 which is built on [FedML](https://github.com/FedML-AI/FedML). It adds a deadline-bound communication
 simulator, a nested "anytime" upload mechanism with a matching aggregation rule (**CASCADE**), a
 capacity-aware subnet assignment policy (**MaxFit**), and the scripts and data behind the paper's
-figures. Code inherited from SuperFedNAS keeps its original behavior. See
-[What is new and what is inherited](#what-is-new-and-what-is-inherited).
+figures. The new code lives mainly in `fedml_api/standalone/superfednas/comm_sim/`, and the table in
+[Method](#how-the-papers-terms-map-to-the-code) shows where each idea is implemented.
 
 <p align="center">
   <img src="docs/figures/03-cascade-stream.png" alt="CASCADE: nested anytime delivery in one round" width="92%">
@@ -26,16 +26,15 @@ figures. Code inherited from SuperFedNAS keeps its original behavior. See
 1. [Motivation](#motivation)
 2. [Method](#method)
 3. [Results](#results)
-4. [What is new and what is inherited](#what-is-new-and-what-is-inherited)
-5. [Repository layout](#repository-layout)
-6. [Installation](#installation)
-7. [Quick start](#quick-start)
-8. [Reproducing the experiments](#reproducing-the-experiments)
-9. [Data and results in this repository](#data-and-results-in-this-repository)
-10. [Tests](#tests)
-11. [Known limitations](#known-limitations)
-12. [Citation](#citation)
-13. [License and acknowledgements](#license-and-acknowledgements)
+4. [Repository layout](#repository-layout)
+5. [Installation](#installation)
+6. [Quick start](#quick-start)
+7. [Reproducing the experiments](#reproducing-the-experiments)
+8. [Data and results in this repository](#data-and-results-in-this-repository)
+9. [Tests](#tests)
+10. [Known limitations](#known-limitations)
+11. [Citation](#citation)
+12. [License and acknowledgements](#license-and-acknowledgements)
 
 ## Motivation
 
@@ -107,6 +106,10 @@ deployable subnet delivered, and the full experimental protocol.
 | FedAvg and FedNAS under the same deadline | [`cluster/run_fedavg_commsim.sbatch`](cluster/run_fedavg_commsim.sbatch), [`cluster/run_fednas_commsim.sbatch`](cluster/run_fednas_commsim.sbatch) |
 | Pareto-front search on a trained supernet | [`fedml_experiments/standalone/superfednas/search_phase.py`](fedml_experiments/standalone/superfednas/search_phase.py) |
 
+The `comm_sim/policies/` package (greedy, Lyapunov and contextual-bandit assignment, plus
+client-selection probes) is exploratory code written along the way. It is not part of the results
+reported below.
+
 ## Results
 
 The setting is 20 clients with 8 participating per round, 150 rounds, a 20 s deadline, and a
@@ -176,35 +179,6 @@ connected clients.
 All figures are taken from the paper. The numbers behind them are in
 [`analysis/csv/`](analysis/csv) and [`results/pareto/`](results/pareto).
 
-## What is new and what is inherited
-
-The first commit of this repository (`eb8ef11`) is the SuperFedNAS-derived snapshot. Everything
-after it is new work. To list what changed:
-
-```bash
-git diff --stat eb8ef11 HEAD
-```
-
-| Added by this work | Path |
-| --- | --- |
-| Deadline-bound communication simulator, bandwidth models, trace replay | `fedml_api/standalone/superfednas/comm_sim/` |
-| Transmission plans, nested shell and block streams, sharding | `comm_sim/transmission.py`, `comm_sim/sharding.py` |
-| Aggregation rules under partial delivery | `comm_sim/aggregation.py` |
-| Subnet assignment (MaxFit and successors) and client selection | `Server/ServerModel/base_server_model.py`, `comm_sim/policies/` |
-| Pure-Python self-tests for all of the above | `comm_sim/selftest_*.py`, `comm_sim/verify_nesting.py` |
-| Search phase on a trained supernet | `fedml_experiments/standalone/superfednas/search_phase.py` |
-| SLURM runners for every experiment | `cluster/` |
-| Offline delivery sweeps, trace archives, log parsing | `analysis/` |
-| Hooks into the trainer, CLI flags, baselines under a deadline | edits to `superfednas_trainer.py`, `parse_args.py`, `train.py`, and the FedAvg and FedNAS entry points |
-
-Inherited from SuperFedNAS and FedML, unchanged in purpose: the FL framework (`fedml_core/`,
-`fedml_api/`), the elastic ResNet and MobileNet supernets (`elastic_nn/`), MaxNet training, the
-evolutionary search (`nas/`), and the plots in `pareto_plotting/` and `figures/`.
-
-The `comm_sim/policies/` package (greedy, Lyapunov and contextual-bandit assignment, plus
-client-selection probes) is exploratory code written along the way. It is not part of the results
-reported above.
-
 ## Repository layout
 
 ```
@@ -228,8 +202,8 @@ reported above.
 ├── analysis/                   offline sweeps, trace archives, log parsing, result CSVs
 ├── results/pareto/             Pareto-search outputs
 ├── docs/figures/               figures from the paper
-├── nas/                        SuperFedNAS evolutionary search (inherited)
-├── pareto_plotting/, figures/  plots and notebooks from SuperFedNAS (inherited)
+├── nas/                        SuperFedNAS evolutionary search
+├── pareto_plotting/, figures/  plots and notebooks from the SuperFedNAS paper
 ├── requirements-modern.txt     installable dependency set
 ├── requirements.txt, eccv_2024.yml   original pinned environment (see Installation)
 └── LICENSE, NOTICE, CITATION.cff
@@ -442,8 +416,8 @@ This is research code, released so that the work can be inspected and built upon
 - **`main_fedavg.py` contains a hard-coded W&B entity.** Change it before running the FedAvg
   baseline with logging enabled.
 - **Training is not bit-reproducible.** See the note on determinism above.
-- **Inherited code is largely untouched.** Many FedML modules in `fedml_api/` (other FL algorithms,
-  datasets) are not exercised by this work and are not maintained here.
+- **Much of the FedML framework is not exercised here.** Many modules in `fedml_api/` (other FL
+  algorithms, datasets) come from FedML and are not maintained in this repository.
 - **The figures are raster images** taken from the compiled paper.
 
 ## Citation
@@ -481,7 +455,8 @@ If you use this code, please cite the thesis and the work that it builds on.
 
 This project is released under the [Apache License 2.0](LICENSE). It is a derivative of SuperFedNAS
 (Apache-2.0) and contains code from FedML (Apache-2.0). [`NOTICE`](NOTICE) lists the attributions and
-states which parts were modified, as the license requires. Dependencies are not vendored: the
+states which parts were modified, as the license requires. The first commit of this repository
+(`eb8ef11`) is the SuperFedNAS-derived snapshot, so `git diff --stat eb8ef11 HEAD` lists every change. Dependencies are not vendored: the
 once-for-all package (MIT) and PyTorch are installed separately under their own licenses.
 
 Datasets (CIFAR-10, CIFAR-100, CINIC-10) and the measured bandwidth traces (Irish 4G LTE by Raca et
