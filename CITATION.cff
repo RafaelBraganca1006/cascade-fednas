@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: "Bragança Oliveira"
     given-names: "Rafael"
-repository-code: "https://github.com/RafaelBraganca1006/dynfednas"
+repository-code: "https://github.com/RafaelBraganca1006/cascade-fednas"
 license: Apache-2.0
 keywords:
   - federated learning
