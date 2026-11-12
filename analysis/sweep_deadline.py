@@ -158,16 +158,17 @@ def selected_clients(round_idx):
     return list(np.random.choice(range(NUM_CLIENTS), PER_ROUND, replace=False))
 
 
-def build_bandwidth():
+def build_bandwidth(bw_seed=None):
     """The trainer's bandwidth model. At corr=0 the connectivity-tier split is a
     pure function of (seed, n, fractions) -- assign_connectivity_tiers scales the
     label centre-of-mass by corr -- so dummy class counts give the identical
     split a real corr=0 run gets (the argument pick_deadline.py already makes)."""
+    seed = BW_SEED if bw_seed is None else bw_seed
     dummy = {c: np.ones(10, dtype=np.int64) for c in range(NUM_CLIENTS)}
-    tiers = assign_connectivity_tiers(dummy, corr=0.0, seed=BW_SEED)
+    tiers = assign_connectivity_tiers(dummy, corr=0.0, seed=seed)
     return MarkovBandwidth.tiered_continuous(
         num_clients=NUM_CLIENTS, num_rounds=ROUNDS, client_tiers=tiers,
-        seed=BW_SEED, jitter_sigma=JITTER,
+        seed=seed, jitter_sigma=JITTER,
     )
 
 
@@ -261,7 +262,7 @@ def sweep(plans, bw_for, deadlines, fixed_payloads):
     summing CommSimulator's own round-time rule (the deadline if anything was
     still in flight when it expired, otherwise the last successful upload's
     finish time). That column is what makes "just raise the deadline" a
-    quantified trade instead of a free win -- see docs/THESIS.md 4.2.
+    quantified trade instead of a free win -- see the thesis, Section 4.2.
     """
     rows = []
     per_round = {}
@@ -332,6 +333,38 @@ def build_fixed_payloads():
     }
 
 
+def build_sprout_bandwidth_factory(num_clients, num_rounds, seed, archive):
+    """A ``bw_for(T)`` over the Sprout UPLINK traces.
+
+    Identical in shape to the Irish factory, and different in one way that
+    matters: these are measurements of the direction the deadline actually
+    constrains, so no ul_factor is applied and none is offered. There is nothing
+    to correct for.
+    """
+    from fedml_api.standalone.superfednas.comm_sim.bandwidth import (
+        TraceReplayBandwidth,
+    )
+    from fedml_api.standalone.superfednas.comm_sim.traces import (
+        load_sprout_client_traces,
+    )
+
+    client_traces, offsets, which = load_sprout_client_traces(
+        num_clients, seed=seed, path=archive)
+    mix = {n: which.count(n) for n in sorted(set(which))}
+    print("  uplink trace population: %s" % mix)
+    allv = np.concatenate([client_traces[c] for c in client_traces])
+    print("  measured uplink: median %.2f Mbit/s, p10 %.2f, p90 %.2f"
+          % (np.median(allv) / 1e6, np.percentile(allv, 10) / 1e6,
+             np.percentile(allv, 90) / 1e6))
+
+    def bw_for(T):
+        return TraceReplayBandwidth(
+            client_traces, num_rounds=num_rounds, window_s=T,
+            sample_hz=1.0, start_offsets=offsets)
+
+    return bw_for
+
+
 def build_trace_bandwidth_factory(num_clients, num_rounds, seed, patterns,
                                   ul_factor, archive):
     """A ``bw_for(T)`` over the measured Irish 4G traces.
@@ -374,7 +407,7 @@ def main():
     ap.add_argument("--rounds", type=int, default=ROUNDS,
                     help="replay fewer rounds (smoke only -- the CSV is "
                          "only valid at the full 150)")
-    ap.add_argument("--bandwidth", choices=["synthetic", "trace"],
+    ap.add_argument("--bandwidth", choices=["synthetic", "trace", "sprout"],
                     default="synthetic",
                     help="synthetic = the canonical tiered_continuous chains; "
                          "trace = replay of the measured Irish 4G dataset")
@@ -383,6 +416,11 @@ def main():
                     help="restrict the trace population to these mobility "
                          "patterns (default: all five)")
     ap.add_argument("--trace-seed", type=int, default=BW_SEED)
+    ap.add_argument("--bw-seed", type=int, default=None,
+                    help="synthetic channel seed. The sweep is exact given one "
+                         "channel realization, so a confidence band over it "
+                         "requires running several seeds and is not something "
+                         "one run can report.")
     ap.add_argument("--ul-factor", type=float, default=1.0,
                     help="scale every measured sample; 1.0 = as measured "
                          "(downlink, optimistic for an uplink deadline), "
@@ -425,17 +463,20 @@ def main():
               % (args.dump_plans, os.path.getsize(args.dump_plans) / 1e6))
         return
 
-    if args.bandwidth == "trace":
+    if args.bandwidth == "sprout":
+        bw_for = build_sprout_bandwidth_factory(
+            NUM_CLIENTS, args.rounds, args.trace_seed, args.trace_archive)
+    elif args.bandwidth == "trace":
         bw_for = build_trace_bandwidth_factory(
             NUM_CLIENTS, args.rounds, args.trace_seed, args.trace_patterns,
             args.ul_factor, args.trace_archive)
     else:
-        chain = build_bandwidth()
+        chain = build_bandwidth(args.bw_seed)
         bw_for = lambda T: chain  # noqa: E731 -- T-independent by construction
 
     out = args.out or os.path.join(
         here, "csv", "deadline_sweep%s.csv"
-        % ("" if args.bandwidth == "synthetic" else "_trace"))
+        % {"synthetic": "", "trace": "_trace", "sprout": "_sprout"}[args.bandwidth])
 
     deadlines = sorted(set(list(args.deadlines) + [20.0]))
     print("sweeping %d deadlines..." % len(deadlines))
