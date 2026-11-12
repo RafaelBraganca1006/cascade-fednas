@@ -1,0 +1,56 @@
+dynFedNAS
+Copyright 2026 Rafael Bragança Oliveira
+
+This product is a derivative work. It includes software developed by third
+parties, listed below, and modifications and additions made by the author.
+
+--------------------------------------------------------------------------------
+SuperFedNAS: Cost-Efficient Federated Neural Architecture Search for On-Device
+Inference (ECCV 2024)
+  Authors: Alind Khare, Animesh Agrawal, Aditya Annavajjala, Payman Behnam,
+           Myungjin Lee, Hugo Latapie, Alexey Tumanov
+  Source:  https://github.com/gatech-sysml/superfednas
+  License: Apache License 2.0
+
+  This repository started from a snapshot of the SuperFedNAS source code. The
+  snapshot is the first commit of this repository (eb8ef11).
+
+--------------------------------------------------------------------------------
+FedML: A Research Library and Benchmark for Federated Machine Learning
+  Source:  https://github.com/FedML-AI/FedML
+  License: Apache License 2.0
+
+  The federated learning framework under fedml_core/ and fedml_api/, and the
+  data loaders and baselines in fedml_experiments/, come from FedML through
+  SuperFedNAS. Individual files retain their original headers.
+
+--------------------------------------------------------------------------------
+Modifications (Apache License 2.0, section 4(b))
+
+  The files changed or added after the first commit are the modifications made
+  in this repository. The complete list, with the nature of every change, is
+  available from version control:
+
+      git diff --stat eb8ef11 HEAD
+
+  In summary:
+    - Added: the communication simulator, bandwidth models, transmission
+      plans, aggregation rules, assignment and selection policies and their
+      self-tests (fedml_api/standalone/superfednas/comm_sim/); the search-phase
+      runner (fedml_experiments/standalone/superfednas/search_phase.py); the
+      SLURM scripts (cluster/); the deadline-sweep analysis (analysis/).
+    - Modified: the SuperFedNAS trainer, client trainers, server models and
+      command-line arguments, to integrate the above; the FedAvg and FedNAS
+      entry points, to run them under a round deadline; the CIFAR-10 and
+      CIFAR-100 data loaders.
+
+--------------------------------------------------------------------------------
+Dependencies that are not distributed with this repository
+
+  Once-for-All (MIT HAN Lab), MIT License, installed as the `ofa` package.
+  PyTorch and the other packages in requirements-modern.txt, under their own
+  licenses.
+
+  Datasets (CIFAR-10, CIFAR-100, CINIC-10) and bandwidth traces (Irish 4G LTE
+  dataset, Raca et al., MMSys 2018; Sprout traces, Winstein et al., NSDI 2013)
+  are not distributed here and keep their own terms.

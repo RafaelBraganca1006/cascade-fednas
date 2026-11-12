@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the thesis below and the work it builds on."
+title: "dynFedNAS: CASCADE, anytime supernet delivery for federated neural architecture search under dynamic bandwidth"
+type: software
+authors:
+  - family-names: "Bragança Oliveira"
+    given-names: "Rafael"
+repository-code: "https://github.com/RafaelBraganca1006/dynfednas"
+license: Apache-2.0
+keywords:
+  - federated learning
+  - neural architecture search
+  - supernet
+  - communication efficiency
+  - dynamic bandwidth
+preferred-citation:
+  type: thesis
+  title: "CASCADE: Anytime Supernet Delivery for Federated Neural Architecture Search under Dynamic Bandwidth"
+  authors:
+    - family-names: "Bragança Oliveira"
+      given-names: "Rafael"
+  institution:
+    name: "ETH Zürich"
+  thesis-type: "Bachelor's thesis"
+  year: 2026
+references:
+  - type: conference-paper
+    title: "SuperFedNAS: Cost-Efficient Federated Neural Architecture Search for On-Device Inference"
+    authors:
+      - {family-names: Khare, given-names: Alind}
+      - {family-names: Agrawal, given-names: Animesh}
+      - {family-names: Annavajjala, given-names: Aditya}
+      - {family-names: Behnam, given-names: Payman}
+      - {family-names: Lee, given-names: Myungjin}
+      - {family-names: Latapie, given-names: Hugo}
+      - {family-names: Tumanov, given-names: Alexey}
+    collection-title: "Proceedings of the 18th European Conference on Computer Vision (ECCV)"
+    year: 2024
+    url: "https://arxiv.org/abs/2301.10879"
